@@ -210,14 +210,8 @@ func (d *H264MFTDecoder) configure(cfg H264DecoderConfig) error {
 		}
 	}
 
-	// 5. 查询输出流信息，决定缓冲区由谁分配。
-	var streamInfo mf.MFT_OUTPUT_STREAM_INFO
-	d.transform.GetOutputStreamInfo(0, &streamInfo)
-	d.providesSamples = (streamInfo.DwFlags & mf.MFT_OUTPUT_STREAM_PROVIDES_SAMPLES) != 0
-	d.outputBufSize = streamInfo.CbSize
-	if d.outputBufSize == 0 {
-		d.outputBufSize = 8 * 1024 * 1024
-	}
+	// 6. 查询输出流信息，决定缓冲区由谁分配。
+	d.refreshOutputStreamInfo()
 
 	d.transform.ProcessMessage(mf.MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0)
 	d.transform.ProcessMessage(mf.MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0)
@@ -299,6 +293,10 @@ func (d *H264MFTDecoder) setOutputType(cfg H264DecoderConfig) error {
 			seen = append(seen, mf.SubtypeName(sub))
 		}
 		if sub == cfg.Output {
+			if fallback != nil {
+				fallback.Release()
+				fallback = nil
+			}
 			chosen = mt
 			break
 		}
@@ -335,6 +333,16 @@ func (d *H264MFTDecoder) setOutputType(cfg H264DecoderConfig) error {
 		return fmt.Errorf("SetOutputType(%s): %w", mf.SubtypeName(d.outSubtype), d3d.HRESULT(hr))
 	}
 	return nil
+}
+
+func (d *H264MFTDecoder) refreshOutputStreamInfo() {
+	var streamInfo mf.MFT_OUTPUT_STREAM_INFO
+	d.transform.GetOutputStreamInfo(0, &streamInfo)
+	d.providesSamples = (streamInfo.DwFlags & mf.MFT_OUTPUT_STREAM_PROVIDES_SAMPLES) != 0
+	d.outputBufSize = streamInfo.CbSize
+	if d.outputBufSize == 0 {
+		d.outputBufSize = 8 * 1024 * 1024
+	}
 }
 
 // OutputFormat 返回协商后的输出像素格式与尺寸。
@@ -472,10 +480,6 @@ func (d *H264MFTDecoder) drainOutputs() ([]*DecodedFrame, error) {
 		}
 		frames = append(frames, f)
 		if !more {
-			// 保险起见再试一次，但最多再取一帧，避免死循环。
-			if f2, _, err2 := d.processOutput(); err2 == nil && f2 != nil {
-				frames = append(frames, f2)
-			}
 			return frames, nil
 		}
 	}
@@ -492,53 +496,55 @@ func (d *H264MFTDecoder) processOutput() (frame *DecodedFrame, more bool, err er
 		}
 	}
 
-	outData := mf.MFT_OUTPUT_DATA_BUFFER{}
-	var allocated *mf.IMFSample
-	if !d.providesSamples {
-		if hr := mf.MFCreateSample(&allocated); d3d.HRESULT(hr).Failed() {
-			return nil, false, fmt.Errorf("MFCreateSample: %w", d3d.HRESULT(hr))
+	for streamChangeRetries := 0; streamChangeRetries < 3; streamChangeRetries++ {
+		outData := mf.MFT_OUTPUT_DATA_BUFFER{}
+		var allocated *mf.IMFSample
+		if !d.providesSamples {
+			if hr := mf.MFCreateSample(&allocated); d3d.HRESULT(hr).Failed() {
+				return nil, false, fmt.Errorf("MFCreateSample: %w", d3d.HRESULT(hr))
+			}
+			var outBuf *mf.IMFMediaBuffer
+			if hr := mf.MFCreateMemoryBuffer(d.outputBufSize, &outBuf); d3d.HRESULT(hr).Failed() {
+				allocated.Release()
+				return nil, false, fmt.Errorf("MFCreateMemoryBuffer: %w", d3d.HRESULT(hr))
+			}
+			allocated.AddBuffer(outBuf)
+			outBuf.Release()
+			outData.PSample = allocated
 		}
-		var outBuf *mf.IMFMediaBuffer
-		if hr := mf.MFCreateMemoryBuffer(d.outputBufSize, &outBuf); d3d.HRESULT(hr).Failed() {
-			allocated.Release()
-			return nil, false, fmt.Errorf("MFCreateMemoryBuffer: %w", d3d.HRESULT(hr))
-		}
-		allocated.AddBuffer(outBuf)
-		outBuf.Release()
-		outData.PSample = allocated
-	}
 
-	var status uint32
-	hr := d.transform.ProcessOutput(0, 1, &outData, &status)
-	if allocated != nil {
-		// ProcessOutput 成功时 PSample 由 MFT 填好；失败或无输出时我们要自己回收。
-		if d3d.HRESULT(hr).Failed() || outData.PSample == nil {
-			allocated.Release()
+		var status uint32
+		hr := d.transform.ProcessOutput(0, 1, &outData, &status)
+		if allocated != nil {
+			if d3d.HRESULT(hr).Failed() || outData.PSample == nil {
+				allocated.Release()
+			}
 		}
-	}
-	if uint32(hr) == mf.MF_E_TRANSFORM_NEED_MORE_INPUT {
-		return nil, false, nil
-	}
-	if uint32(hr) == mf.MF_E_TRANSFORM_STREAM_CHANGE {
-		// 码流分辨率变了（被控端改分辨率 / 换显示器）：必须重新协商输出类型再取帧。
-		if err := d.setOutputType(d.cfg); err != nil {
-			return nil, false, fmt.Errorf("renegotiate output after stream change: %w", err)
+		if uint32(hr) == mf.MF_E_TRANSFORM_NEED_MORE_INPUT {
+			return nil, false, nil
 		}
-		return nil, false, nil
-	}
-	if d3d.HRESULT(hr).Failed() {
-		return nil, false, fmt.Errorf("ProcessOutput: %w", d3d.HRESULT(hr))
-	}
-	if outData.PSample == nil {
-		return nil, false, nil
-	}
-	defer outData.PSample.Release()
+		if uint32(hr) == mf.MF_E_TRANSFORM_STREAM_CHANGE {
+			if err := d.setOutputType(d.cfg); err != nil {
+				return nil, false, fmt.Errorf("renegotiate output after stream change: %w", err)
+			}
+			d.refreshOutputStreamInfo()
+			continue
+		}
+		if d3d.HRESULT(hr).Failed() {
+			return nil, false, fmt.Errorf("ProcessOutput: %w", d3d.HRESULT(hr))
+		}
+		if outData.PSample == nil {
+			return nil, false, nil
+		}
+		defer outData.PSample.Release()
 
-	f, err := d.extractFrame(outData.PSample)
-	if err != nil {
-		return nil, false, err
+		f, err := d.extractFrame(outData.PSample)
+		if err != nil {
+			return nil, false, err
+		}
+		return f, (outData.DwStatus & mf.MFT_OUTPUT_DATA_BUFFER_INCOMPLETE) != 0, nil
 	}
-	return f, (outData.DwStatus & mf.MFT_OUTPUT_DATA_BUFFER_INCOMPLETE) != 0, nil
+	return nil, false, fmt.Errorf("too many consecutive stream changes")
 }
 
 func (d *H264MFTDecoder) extractFrame(sample *mf.IMFSample) (*DecodedFrame, error) {
@@ -580,7 +586,7 @@ func (d *H264MFTDecoder) Flush() ([]*DecodedFrame, error) {
 		for {
 			et, err := d.getNextEventType()
 			if err != nil {
-				return frames, nil
+				return frames, err
 			}
 			if et == mf.METransformDrainComplete {
 				return frames, nil
@@ -606,30 +612,48 @@ func (d *H264MFTDecoder) Flush() ([]*DecodedFrame, error) {
 	}
 }
 
+const eventPollTimeout = 5 * time.Second
+
 func (d *H264MFTDecoder) waitForEventType(target uint32) error {
+	deadline := time.Now().Add(eventPollTimeout)
 	for {
-		var ev *mf.IMFMediaEvent
-		if hr := d.eventGen.GetEvent(0, &ev); d3d.HRESULT(hr).Failed() {
-			return fmt.Errorf("GetEvent: %w", d3d.HRESULT(hr))
+		et, err := d.getNextEvent()
+		if err != nil {
+			return err
 		}
-		var et uint32
-		ev.GetType(&et)
-		ev.Release()
 		if et == target {
 			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("waitForEventType(%d): timed out after %v", target, eventPollTimeout)
 		}
 	}
 }
 
 func (d *H264MFTDecoder) getNextEventType() (uint32, error) {
-	var ev *mf.IMFMediaEvent
-	if hr := d.eventGen.GetEvent(0, &ev); d3d.HRESULT(hr).Failed() {
-		return 0, fmt.Errorf("GetEvent: %w", d3d.HRESULT(hr))
+	return d.getNextEvent()
+}
+
+func (d *H264MFTDecoder) getNextEvent() (uint32, error) {
+	deadline := time.Now().Add(eventPollTimeout)
+	for {
+		var ev *mf.IMFMediaEvent
+		hr := d.eventGen.GetEvent(mf.MF_EVENT_FLAG_NO_WAIT, &ev)
+		if uint32(hr) == mf.MF_E_NO_EVENTS_AVAILABLE {
+			if time.Now().After(deadline) {
+				return 0, fmt.Errorf("getNextEvent: timed out after %v", eventPollTimeout)
+			}
+			time.Sleep(time.Millisecond)
+			continue
+		}
+		if d3d.HRESULT(hr).Failed() {
+			return 0, fmt.Errorf("GetEvent: %w", d3d.HRESULT(hr))
+		}
+		var et uint32
+		ev.GetType(&et)
+		ev.Release()
+		return et, nil
 	}
-	var et uint32
-	ev.GetType(&et)
-	ev.Release()
-	return et, nil
 }
 
 // Release 释放所有 COM 资源。

@@ -141,12 +141,16 @@ func splitAccessUnits(data []byte) [][]byte {
 		if j < 0 {
 			break
 		}
-		pos := j + 3
-		if pos >= len(data) {
+		hdrPos := j + 3
+		if hdrPos >= len(data) {
 			break
 		}
-		nals = append(nals, nal{start: j, typ: data[pos] & 0x1F})
-		i = pos + 1
+		nalStart := j
+		if j > 0 && data[j-1] == 0 {
+			nalStart = j - 1
+		}
+		nals = append(nals, nal{start: nalStart, typ: data[hdrPos] & 0x1F})
+		i = hdrPos + 1
 	}
 	if len(nals) == 0 {
 		return nil
@@ -171,7 +175,7 @@ func splitAccessUnits(data []byte) [][]byte {
 	return aus
 }
 
-// indexStartCode 找 00 00 01（3 字节或 4 字节起始码的公共尾部）的位置。
+// indexStartCode 找 00 00 01（3 字节起始码的公共尾部）的位置。
 func indexStartCode(b []byte, from int) int {
 	for i := from; i+2 < len(b); i++ {
 		if b[i] == 0 && b[i+1] == 0 && b[i+2] == 1 {
