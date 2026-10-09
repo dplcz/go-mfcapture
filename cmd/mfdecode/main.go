@@ -6,20 +6,51 @@
 //	go run ./cmd/mfencode -duration 3s -o out.h264
 //	go run ./cmd/mfdecode -i out.h264 -o out.nv12
 //	ffplay -f rawvideo -pix_fmt nv12 -video_size 2560x1440 out.nv12
+//
+// 本命令也是 decode.Session 的用例示范：调用方不碰 runtime.LockOSThread、
+// 不碰 CoInitializeEx/MFStartup，全部由 Session.Run 自己收在内部。
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"os"
-	"runtime"
 	"time"
-
-	d3d "github.com/kirides/go-d3d"
 
 	"mfcapture/decode"
 	"mfcapture/mf"
 )
+
+// fileSink 把解出的帧顺序写进输出文件，写完立刻归还。
+type fileSink struct {
+	f      *os.File
+	bgra   bool
+	frames int64
+	bytes  int64
+}
+
+func (s *fileSink) OnFrame(fr *decode.DecodedFrame) {
+	s.frames++
+	s.bytes += write(s.f, fr, s.bgra)
+	fr.Release() // GPU 路径下必须归还，否则解码器 surface 池会被占满
+}
+
+func (s *fileSink) OnEvent(e decode.Event) {
+	switch e.Kind {
+	case decode.EventReady:
+		fmt.Printf("mfdecode: decoder DXVA(硬件加速)=%v output=%s %dx%d stride=%d\n",
+			e.Format.Hardware, mf.SubtypeName(e.Format.Subtype),
+			e.Format.Width, e.Format.Height, e.Format.Stride)
+	case decode.EventFormatChanged:
+		fmt.Printf("mfdecode: 输出格式变化 -> %s %dx%d stride=%d\n",
+			mf.SubtypeName(e.Format.Subtype), e.Format.Width, e.Format.Height, e.Format.Stride)
+	case decode.EventDegraded:
+		fmt.Fprintf(os.Stderr, "mfdecode: DXVA 不可用，已回退到软件解码: %v\n", e.Err)
+	case decode.EventDecodeError:
+		fmt.Fprintf(os.Stderr, "mfdecode: 解码错误: %v\n", e.Err)
+	}
+}
 
 func main() {
 	in := flag.String("i", "out.h264", "input Annex-B H264 file")
@@ -33,6 +64,7 @@ func main() {
 
 	if *verbose {
 		decode.DebugLog = func(s string) { fmt.Fprintln(os.Stderr, "  [diag]", s) }
+		decode.FallbackLog = func(s string) { fmt.Fprintln(os.Stderr, "  [fallback]", s) }
 	}
 
 	data, err := os.ReadFile(*in)
@@ -48,35 +80,6 @@ func main() {
 	aus := splitAccessUnits(data)
 	fmt.Printf("mfdecode: %s -> %s, %d bytes, %d access units\n", *in, *out, len(data), len(aus))
 
-	runtime.LockOSThread()
-	if hr := mf.CoInitializeEx(); d3d.HRESULT(hr).Failed() {
-		fmt.Fprintln(os.Stderr, "CoInitializeEx:", d3d.HRESULT(hr))
-		os.Exit(1)
-	}
-	defer mf.CoUninitialize()
-	if hr := mf.MFStartup(); d3d.HRESULT(hr).Failed() {
-		fmt.Fprintln(os.Stderr, "MFStartup:", d3d.HRESULT(hr))
-		os.Exit(1)
-	}
-	defer mf.MFShutdown()
-
-	dec, err := decode.NewH264MFTDecoder(decode.H264DecoderConfig{
-		Width:           uint32(*w),
-		Height:          uint32(*h),
-		FPSNum:          30,
-		FPSDen:          1,
-		DisableHardware: *nohw,
-	})
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "NewH264MFTDecoder:", err)
-		os.Exit(1)
-	}
-	defer dec.Release()
-
-	sub, ow, oh, stride := dec.OutputFormat()
-	fmt.Printf("mfdecode: decoder DXVA(硬件加速)=%v output=%s %dx%d stride=%d\n",
-		dec.IsHardware, mf.SubtypeName(sub), ow, oh, stride)
-
 	f, err := os.Create(*out)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "create output:", err)
@@ -84,34 +87,56 @@ func main() {
 	}
 	defer f.Close()
 
-	var frames, bytes int64
-	start := time.Now()
-	for i, au := range aus {
-		ts := time.Duration(i) * time.Second / 30
-		got, err := dec.Decode(au, ts, time.Second/30)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "mfdecode: AU %d: %v\n", i, err)
-			continue
-		}
-		for _, fr := range got {
-			frames++
-			bytes += write(f, fr, *bgra)
-		}
-	}
-	tail, _ := dec.Flush()
-	for _, fr := range tail {
-		frames++
-		bytes += write(f, fr, *bgra)
-	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel() // Run 返回后放行喂数据的 goroutine
 
+	sink := &fileSink{f: f, bgra: *bgra}
+	sess, err := decode.NewSession(decode.SessionConfig{
+		H264DecoderConfig: decode.H264DecoderConfig{
+			Width:           uint32(*w),
+			Height:          uint32(*h),
+			FPSNum:          30,
+			FPSDen:          1,
+			DisableHardware: *nohw,
+		},
+	}, sink)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "NewSession:", err)
+		os.Exit(1)
+	}
+	defer sess.Close()
+
+	// 喂数据：Submit 只入队，不阻塞在解码上；队列满就稍等重试。
+	// 全部投完声明输入结束，Run 会排空解码器后正常返回。
+	go func() {
+		for i, au := range aus {
+			ts := time.Duration(i) * time.Second / 30
+			for !sess.Submit(au, ts, time.Second/30) {
+				select {
+				case <-ctx.Done(): // Run 已结束，别再等了
+					return
+				case <-time.After(2 * time.Millisecond):
+				}
+			}
+		}
+		sess.EndOfStream()
+	}()
+
+	start := time.Now()
+	// Run 内部完成 LockOSThread + COM/MF 初始化与清理，调用方什么都不用做。
+	if err := sess.Run(ctx); err != nil {
+		fmt.Fprintln(os.Stderr, "mfdecode: run:", err)
+		os.Exit(1)
+	}
 	elapsed := time.Since(start)
-	fmt.Printf("mfdecode: done. %d frames, %d bytes in %s\n", frames, bytes, elapsed.Round(time.Millisecond))
-	if frames == 0 {
+
+	fmt.Printf("mfdecode: done. %d frames, %d bytes in %s\n", sink.frames, sink.bytes, elapsed.Round(time.Millisecond))
+	if sink.frames == 0 {
 		fmt.Fprintln(os.Stderr, "mfdecode: FAIL - no frames decoded")
 		os.Exit(1)
 	}
 	fmt.Printf("mfdecode: OK. %d 帧，平均 %.2f ms/帧（%.0f fps）\n",
-		frames, float64(elapsed.Milliseconds())/float64(frames), float64(frames)/elapsed.Seconds())
+		sink.frames, float64(elapsed.Milliseconds())/float64(sink.frames), float64(sink.frames)/elapsed.Seconds())
 }
 
 func write(f *os.File, fr *decode.DecodedFrame, asBGRA bool) int64 {
