@@ -91,6 +91,12 @@ type H264MFTDecoder struct {
 	outHeight       uint32
 	outStride       int32
 
+	// stallHook 由 Session 设置：同步 MFT 背压重试期间调用（默认 nil，
+	// 那时只是纯 sleep）。给上层一个"趁等待把已渲染的帧还回来"的机会。
+	stallHook func()
+	// degradeHook 由 Session 设置：DXVA 回退到软件解码时调用，错误原因是入参。
+	degradeHook func(error)
+
 	// IsHardware 表示是否真的启用了硬件加速（DXVA）。
 	// 它不等于"选中的是硬件 MFT"——见 H264DecoderConfig.DisableHardware 的说明。
 	IsHardware bool
@@ -442,6 +448,9 @@ func (d *H264MFTDecoder) Decode(au []byte, ts, dur time.Duration) ([]*DecodedFra
 		// flush 也救不回来），只能整个重建一个不带 DXVA 的解码器。
 		d.fallbackDone = true
 		warnf("DXVA 解码出错(%v)，重建为软件解码器并重试", err)
+		if d.degradeHook != nil {
+			d.degradeHook(err)
+		}
 		rerr := d.rebuildWithoutDXVA()
 		if rerr != nil {
 			warnf("  重建软件解码器失败: %v", rerr)
@@ -528,6 +537,11 @@ func (d *H264MFTDecoder) decodeOnce(au []byte, ts, dur time.Duration) ([]*Decode
 		if derr != nil {
 			sample.Release()
 			return frames, derr
+		}
+		// 背压的根因常常是"已解码的帧还没被归还、surface 池满了"。给上层一个
+		// 归还的机会再睡，否则只是把等待时间整段浪费掉。
+		if d.stallHook != nil {
+			d.stallHook()
 		}
 		time.Sleep(time.Millisecond)
 	}
