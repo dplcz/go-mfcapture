@@ -183,6 +183,9 @@ const (
 	MF_E_TRANSFORM_NEED_MORE_INPUT = 0xC00D6D72
 	MF_E_TRANSFORM_STREAM_CHANGE   = 0xC00D6D61
 	MF_E_INVALIDMEDIATYPE          = 0xC00D36B4
+	// MF_E_NOTACCEPTING：同步 MFT 暂时收不下输入，意思是"先把我的输出
+	// 排空再来"。这是正常的背压信号，不是失败——排空后重试同一个输入即可。
+	MF_E_NOTACCEPTING              = 0xC00D36B5
 	MFT_OUTPUT_STATUS_SAMPLE_READY = 0x1
 )
 

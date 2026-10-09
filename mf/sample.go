@@ -58,6 +58,11 @@ func (obj *IMFSample) AddBuffer(buffer *IMFMediaBuffer) int32 {
 	return int32(ret)
 }
 
+func (obj *IMFSample) AddRef() int32 {
+	ret, _, _ := syscall.SyscallN(obj.vtbl.AddRef, uintptr(unsafe.Pointer(obj)))
+	return int32(ret)
+}
+
 func (obj *IMFSample) Release() int32 {
 	ret, _, _ := syscall.SyscallN(obj.vtbl.Release, uintptr(unsafe.Pointer(obj)))
 	return int32(ret)

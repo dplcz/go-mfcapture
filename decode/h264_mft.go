@@ -11,7 +11,6 @@ import (
 
 	d3d "github.com/kirides/go-d3d"
 	"github.com/kirides/go-d3d/d3d11"
-	"github.com/kirides/go-d3d/dxgi"
 	"golang.org/x/sys/windows"
 
 	"mfcapture/gpu"
@@ -21,6 +20,23 @@ import (
 // DebugLog 若非 nil，会打印候选解码器的协商细节（尤其是为什么某个候选被淘汰），
 // 用于排查"本机明明有硬件解码器，为什么选中的是软件解码器"。
 var DebugLog func(string)
+
+// FallbackLog 若非 nil，DXVA 中途出错、解码器被重建为纯软件解码时会打印原因。
+//
+// 这个回退是静默发生的（Decode 会自动重建后重试，调用方看不到错误），
+// 所以"硬解用着用着就变软解了"这类问题必须靠它才能看见。
+// 不开 DebugLog 也会打——它就是为这种场景准备的。
+var FallbackLog func(string)
+
+func warnf(format string, args ...any) {
+	if FallbackLog != nil {
+		FallbackLog(fmt.Sprintf(format, args...))
+	}
+	debugf(format, args...)
+}
+
+// maxDrainPerCall 是一次排空最多取回几帧。见 drainOutputs 的说明。
+const maxDrainPerCall = 3
 
 func debugf(format string, args ...any) {
 	if DebugLog != nil {
@@ -69,6 +85,7 @@ type H264MFTDecoder struct {
 	fallbackDone    bool
 	providesSamples bool
 	outputBufSize   uint32
+	draining        bool // 是否已发过 DRAIN（Flush 分批取，不能每次都重发）
 	outSubtype      windows.GUID
 	outWidth        uint32
 	outHeight       uint32
@@ -311,9 +328,16 @@ func (d *H264MFTDecoder) setInputType(cfg H264DecoderConfig, withSize bool) erro
 	return nil
 }
 
+// outTypeCand 是解码器报告的一个可选输出类型。
+type outTypeCand struct {
+	mt      *mf.IMFMediaType
+	sub     windows.GUID
+	w, h    uint32
+	hasSize bool
+}
+
 func (d *H264MFTDecoder) setOutputType(cfg H264DecoderConfig) error {
-	var chosen *mf.IMFMediaType
-	var fallback *mf.IMFMediaType
+	var cands []outTypeCand
 	var seen []string
 	for i := uint32(0); i < 64; i++ {
 		var mt *mf.IMFMediaType
@@ -324,49 +348,71 @@ func (d *H264MFTDecoder) setOutputType(cfg H264DecoderConfig) error {
 		mt.GetGUID(mf.MF_MT_SUBTYPE, &sub)
 		var fs uint64
 		hasSize := !d3d.HRESULT(mt.GetUINT64(mf.MF_MT_FRAME_SIZE, &fs)).Failed()
+		c := outTypeCand{mt: mt, sub: sub, hasSize: hasSize}
 		if hasSize {
-			seen = append(seen, fmt.Sprintf("%s %dx%d", mf.SubtypeName(sub), uint32(fs>>32), uint32(fs&0xFFFFFFFF)))
+			c.w, c.h = uint32(fs>>32), uint32(fs&0xFFFFFFFF)
+			seen = append(seen, fmt.Sprintf("%s %dx%d", mf.SubtypeName(sub), c.w, c.h))
 		} else {
-			seen = append(seen, mf.SubtypeName(sub))
+			seen = append(seen, mf.SubtypeName(sub)+"(无尺寸)")
 		}
-		if sub == cfg.Output {
-			if fallback != nil {
-				fallback.Release()
-				fallback = nil
-			}
-			chosen = mt
-			break
-		}
-		if fallback == nil {
-			fallback = mt
-		} else {
-			mt.Release()
-		}
+		cands = append(cands, c)
 	}
 	debugf("  可选输出类型: %v", seen)
-	if chosen == nil {
-		chosen = fallback
-	}
-	if chosen == nil {
+	if len(cands) == 0 {
 		return fmt.Errorf("decoder exposes no output media type")
 	}
-	defer chosen.Release()
 
-	// 记下实际的输出格式与尺寸，供调用方解释 Data。
-	chosen.GetGUID(mf.MF_MT_SUBTYPE, &d.outSubtype)
-	var fs uint64
-	if !d3d.HRESULT(chosen.GetUINT64(mf.MF_MT_FRAME_SIZE, &fs)).Failed() {
-		d.outWidth, d.outHeight = uint32(fs>>32), uint32(fs&0xFFFFFFFF)
+	// 优先级：subtype 匹配且带 MF_MT_FRAME_SIZE > subtype 匹配 > 第一个。
+	//
+	// 为什么要挑带尺寸的：还没喂数据（SPS 还没解析）时，解码器报出来的
+	// 往往只有一个占位尺寸（实测本机是 NV12 1920x1080，真实码流是
+	// 2560x1440）。真正的尺寸要等 MF_E_TRANSFORM_STREAM_CHANGE 之后
+	// 重新枚举才拿得到。所以只要有一个带尺寸的类型就必须优先选它。
+	pick := -1
+	for i, c := range cands {
+		if c.sub == cfg.Output && c.hasSize {
+			pick = i
+			break
+		}
+	}
+	if pick < 0 {
+		for i, c := range cands {
+			if c.sub == cfg.Output {
+				pick = i
+				break
+			}
+		}
+	}
+	if pick < 0 {
+		pick = 0
+	}
+	chosen := cands[pick]
+	for i, c := range cands {
+		if i != pick {
+			c.mt.Release()
+		}
+	}
+	defer chosen.mt.Release()
+
+	// 尺寸/stride 先清零再填：否则上一次协商（或占位尺寸）的旧值会残留，
+	// 调 OutputFormat() 的人会拿到一个和真实码流不符的分辨率。
+	d.outWidth, d.outHeight, d.outStride = 0, 0, 0
+	chosen.mt.GetGUID(mf.MF_MT_SUBTYPE, &d.outSubtype)
+	if chosen.hasSize {
+		d.outWidth, d.outHeight = chosen.w, chosen.h
 	}
 	if d.outWidth == 0 {
 		d.outWidth, d.outHeight = cfg.Width, cfg.Height
 	}
 	var stride uint32
-	if !d3d.HRESULT(chosen.GetUINT32(mf.MF_MT_DEFAULT_STRIDE, &stride)).Failed() {
+	if !d3d.HRESULT(chosen.mt.GetUINT32(mf.MF_MT_DEFAULT_STRIDE, &stride)).Failed() {
 		d.outStride = int32(stride)
 	}
+	if d.outWidth == 0 || d.outHeight == 0 {
+		debugf("  输出类型 %s 没给尺寸（还没解析到 SPS），等 stream change 再定", mf.SubtypeName(d.outSubtype))
+	}
 
-	if hr := d.transform.SetOutputType(0, chosen, 0); d3d.HRESULT(hr).Failed() {
+	if hr := d.transform.SetOutputType(0, chosen.mt, 0); d3d.HRESULT(hr).Failed() {
 		return fmt.Errorf("SetOutputType(%s): %w", mf.SubtypeName(d.outSubtype), d3d.HRESULT(hr))
 	}
 	return nil
@@ -395,10 +441,14 @@ func (d *H264MFTDecoder) Decode(au []byte, ts, dur time.Duration) ([]*DecodedFra
 		// DXVA 出错时这个 MFT 基本就废了（后续 ProcessInput 一律 MF_E_NOTACCEPTING，
 		// flush 也救不回来），只能整个重建一个不带 DXVA 的解码器。
 		d.fallbackDone = true
-		debugf("DXVA 解码出错(%v)，重建为软件解码器并重试", err)
-		if rerr := d.rebuildWithoutDXVA(); rerr == nil {
-			return d.decodeOnce(au, ts, dur)
+		warnf("DXVA 解码出错(%v)，重建为软件解码器并重试", err)
+		rerr := d.rebuildWithoutDXVA()
+		if rerr != nil {
+			warnf("  重建软件解码器失败: %v", rerr)
+			return frames, err
 		}
+		warnf("  已重建为软件解码器，后续帧都走 CPU（DecodedFrame.Texture 为 nil）")
+		return d.decodeOnce(au, ts, dur)
 	}
 	return frames, err
 }
@@ -459,12 +509,31 @@ func (d *H264MFTDecoder) decodeOnce(au []byte, ts, dur time.Duration) ([]*Decode
 		return frames, nil
 	}
 
-	if hr := d.transform.ProcessInput(0, sample, 0); d3d.HRESULT(hr).Failed() {
-		sample.Release()
-		return nil, fmt.Errorf("ProcessInput: %w", d3d.HRESULT(hr))
+	// 同步 MFT：ProcessInput 会因为背压返回 MF_E_NOTACCEPTING，意思是
+	// "我还有输出没取走，先排空再来"。这是正常信号不是失败——实测全速/长时间
+	// 播放时会偶发。正确做法是排空输出后重试同一个 sample，而不是整个重建
+	// 解码器（重建会静默退化成软解）。排空出来的帧也要带回去，别丢。
+	const maxNotAcceptingRetries = 50
+	for attempt := 0; ; attempt++ {
+		hr := d.transform.ProcessInput(0, sample, 0)
+		if !d3d.HRESULT(hr).Failed() {
+			break
+		}
+		if uint32(hr) != mf.MF_E_NOTACCEPTING || attempt >= maxNotAcceptingRetries {
+			sample.Release()
+			return frames, fmt.Errorf("ProcessInput: %w", d3d.HRESULT(hr))
+		}
+		got, derr := d.drainOutputs()
+		frames = append(frames, got...)
+		if derr != nil {
+			sample.Release()
+			return frames, derr
+		}
+		time.Sleep(time.Millisecond)
 	}
 	sample.Release()
-	return d.drainOutputs()
+	tail, err := d.drainOutputs()
+	return append(frames, tail...), err
 }
 
 func (d *H264MFTDecoder) makeInputSample(au []byte) (*mf.IMFSample, error) {
@@ -505,9 +574,14 @@ func (d *H264MFTDecoder) makeInputSample(au []byte) (*mf.IMFSample, error) {
 }
 
 // drainOutputs 反复 ProcessOutput，直到本次没有更多输出为止。
+//
+// 一次最多取回 maxDrainPerCall 帧：0 拷贝路径下每取一帧就占住解码器的一张
+// surface，要等调用方渲染完 Release 才归还。而解码器的 surface 池只有个位数
+// （实测 ArraySize=6），一次抓太多会让下一次 ProcessOutput 等不到空闲
+// surface 而永久阻塞——Flush 的时候就踩过这个坑。剩下的帧下一次再取。
 func (d *H264MFTDecoder) drainOutputs() ([]*DecodedFrame, error) {
 	var frames []*DecodedFrame
-	for {
+	for len(frames) < maxDrainPerCall {
 		f, more, err := d.processOutput()
 		if err != nil {
 			return frames, err
@@ -520,6 +594,7 @@ func (d *H264MFTDecoder) drainOutputs() ([]*DecodedFrame, error) {
 			return frames, nil
 		}
 	}
+	return frames, nil
 }
 
 func (d *H264MFTDecoder) processOutput() (frame *DecodedFrame, more bool, err error) {
@@ -618,6 +693,12 @@ func (d *H264MFTDecoder) extractFrame(sample *mf.IMFSample) (*DecodedFrame, erro
 	}, nil
 }
 
+// extractFrameGPU 取出 DXVA 解码器输出的纹理。
+//
+// 0 拷贝：不做 CopySubresourceRegion，直接把解码器 surface 池里的那张纹理
+// 带出去。GetResource 返回的指针已经 AddRef 过，这里再 AddRef 一次
+// IMFSample——只要 sample 还活着，解码器就不会把这张 surface 拿去复用。
+// 代价是调用方必须渲染完再调 DecodedFrame.Release()，见该方法的注释。
 func (d *H264MFTDecoder) extractFrameGPU(sample *mf.IMFSample) (*DecodedFrame, error) {
 	var buf *mf.IMFMediaBuffer
 	if hr := sample.GetBufferByIndex(0, &buf); d3d.HRESULT(hr).Failed() {
@@ -636,7 +717,6 @@ func (d *H264MFTDecoder) extractFrameGPU(sample *mf.IMFSample) (*DecodedFrame, e
 		return nil, fmt.Errorf("GetResource(ID3D11Texture2D): %w", d3d.HRESULT(hr))
 	}
 	srcTex := (*d3d11.ID3D11Texture2D)(srcTexPtr)
-	defer srcTex.Release()
 
 	var subIdx uint32
 	dxgiBuf.GetSubresourceIndex(&subIdx)
@@ -644,73 +724,78 @@ func (d *H264MFTDecoder) extractFrameGPU(sample *mf.IMFSample) (*DecodedFrame, e
 	var desc d3d11.D3D11_TEXTURE2D_DESC
 	srcTex.GetDesc(&desc)
 
-	copyDesc := d3d11.D3D11_TEXTURE2D_DESC{
-		Width:     desc.Width,
-		Height:    desc.Height,
-		MipLevels: 1,
-		ArraySize: 1,
-		Format:    desc.Format,
-		SampleDesc: dxgi.DXGI_SAMPLE_DESC{
-			Count:   1,
-			Quality: 0,
-		},
-		Usage:     d3d11.D3D11_USAGE_DEFAULT,
-		BindFlags: 0,
-	}
-	var privateTex *d3d11.ID3D11Texture2D
-	if hr := d.device.CreateTexture2D(&copyDesc, &privateTex); d3d.HRESULT(hr).Failed() {
-		return nil, fmt.Errorf("CreateTexture2D(copy): %w", d3d.HRESULT(hr))
-	}
-	d.deviceCtx.CopySubresourceRegion2D(privateTex, 0, 0, 0, 0, srcTex, subIdx, nil)
+	// 抓住 sample：它是这张 surface 的"租约"，Release 之前解码器不会回收。
+	sample.AddRef()
 
 	var ts, dur int64
 	sample.GetSampleTime(&ts)
 	sample.GetSampleDuration(&dur)
 
-	return &DecodedFrame{
-		Texture:   privateTex,
-		SubIndex:  0,
+	f := &DecodedFrame{
+		Texture:   srcTex,
+		SubIndex:  subIdx,
 		Subtype:   d.outSubtype,
 		Width:     desc.Width,
 		Height:    desc.Height,
 		Stride:    d.outStride,
 		Timestamp: time.Duration(ts * 100),
 		Duration:  time.Duration(dur * 100),
-	}, nil
+	}
+	f.release = func() {
+		srcTex.Release() // 归还 GetResource 给的引用
+		sample.Release() // 归还 sample → surface 回到解码器池
+	}
+	return f, nil
 }
 
 // Flush 通知解码器排空缓冲并取回剩余帧。
+//
+// 一次最多返回 maxDrainPerCall 帧（原因见 drainOutputs 的注释：0 拷贝下每帧
+// 都占着解码器 surface，一次抓太多会把池子占满导致 ProcessOutput 永久阻塞）。
+// 调用方应当渲染 + Release 之后**反复调用**，直到返回 0 帧才算真的排空：
+//
+//	for {
+//	    tail, _ := dec.Flush()
+//	    if len(tail) == 0 { break }
+//	    渲染并 Release(tail...)
+//	}
 func (d *H264MFTDecoder) Flush() ([]*DecodedFrame, error) {
-	d.transform.ProcessMessage(mf.MFT_MESSAGE_COMMAND_DRAIN, 0)
+	if !d.draining {
+		d.transform.ProcessMessage(mf.MFT_MESSAGE_COMMAND_DRAIN, 0)
+		d.draining = true
+	}
 	if d.isAsync {
 		var frames []*DecodedFrame
 		for {
 			et, err := d.getNextEventType()
 			if err != nil {
+				d.draining = false
 				return frames, err
 			}
 			if et == mf.METransformDrainComplete {
+				d.draining = false
 				return frames, nil
 			}
 			if et == mf.METransformHaveOutput {
 				f, _, err := d.processOutput()
 				if err != nil {
+					d.draining = false
 					return frames, err
 				}
 				if f != nil {
 					frames = append(frames, f)
 				}
+				if len(frames) >= maxDrainPerCall {
+					return frames, nil
+				}
 			}
 		}
 	}
-	var frames []*DecodedFrame
-	for {
-		f, _, err := d.processOutput()
-		if err != nil || f == nil {
-			return frames, nil
-		}
-		frames = append(frames, f)
+	frames, err := d.drainOutputs()
+	if len(frames) == 0 || err != nil {
+		d.draining = false // 排空结束
 	}
+	return frames, err
 }
 
 const eventPollTimeout = 5 * time.Second
