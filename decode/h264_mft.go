@@ -10,6 +10,8 @@ import (
 	"unsafe"
 
 	d3d "github.com/kirides/go-d3d"
+	"github.com/kirides/go-d3d/d3d11"
+	"github.com/kirides/go-d3d/dxgi"
 	"golang.org/x/sys/windows"
 
 	"mfcapture/gpu"
@@ -43,6 +45,11 @@ type H264DecoderConfig struct {
 	// 通过 MFT_MESSAGE_SET_D3D_MANAGER 把 D3D11 设备交给它——不交就内部退化成软件解码。
 	// 所以"开启硬件加速"的正确做法不是换 MFT，而是给它设备管理器。
 	DisableHardware bool
+	// Device/DeviceCtx 可选传入一个已有的 D3D11 设备。若非 nil，解码器复用该设备
+	// （不释放它），使解码器输出的纹理与调用方的渲染设备属于同一个 D3D11 Device，
+	// 实现零拷贝渲染。若为 nil，解码器自行创建并管理设备（向后兼容）。
+	Device    *d3d11.ID3D11Device
+	DeviceCtx *d3d11.ID3D11DeviceContext
 }
 
 var _ Decoder = (*H264MFTDecoder)(nil)
@@ -50,13 +57,16 @@ var _ Decoder = (*H264MFTDecoder)(nil)
 // H264MFTDecoder 包装一个 Media Foundation H264 解码器 MFT。
 // 支持同步与异步两种 MFT；默认把 D3D11 设备管理器交给它以启用 DXVA 硬件解码。
 type H264MFTDecoder struct {
-	cfg             H264DecoderConfig // 分辨率变化后重新协商输出类型时要用到
+	cfg             H264DecoderConfig
 	transform       *mf.IMFTransform
 	eventGen        *mf.IMFMediaEventGenerator
 	devMgr          *mf.IMFDXGIDeviceManager
+	device          *d3d11.ID3D11Device
+	deviceCtx       *d3d11.ID3D11DeviceContext
+	ownsDevice      bool
 	isAsync         bool
 	dxva            bool
-	fallbackDone    bool // DXVA 失败回退只尝试一次，避免每帧都重建
+	fallbackDone    bool
 	providesSamples bool
 	outputBufSize   uint32
 	outSubtype      windows.GUID
@@ -212,31 +222,56 @@ func (d *H264MFTDecoder) configure(cfg H264DecoderConfig) error {
 // enableDXVA 创建 D3D11 设备与设备管理器并交给解码器 MFT，启用 DXVA 硬件解码。
 // 任何一步失败都记录原因并保持未启用状态，调用方无需特殊处理。
 func (d *H264MFTDecoder) enableDXVA() {
-	device, deviceCtx, err := gpu.NewVideoCapableDevice()
-	if err != nil {
-		debugf("  DXVA 不可用（建 D3D11 设备失败）: %v", err)
-		return
+	var device *d3d11.ID3D11Device
+	var deviceCtx *d3d11.ID3D11DeviceContext
+
+	if d.cfg.Device != nil && d.cfg.DeviceCtx != nil {
+		device = d.cfg.Device
+		deviceCtx = d.cfg.DeviceCtx
+		d.ownsDevice = false
+	} else {
+		var err error
+		device, deviceCtx, err = gpu.NewVideoCapableDevice()
+		if err != nil {
+			debugf("  DXVA 不可用（建 D3D11 设备失败）: %v", err)
+			return
+		}
+		d.ownsDevice = true
 	}
-	defer device.Release()
-	defer deviceCtx.Release()
 
 	if err := gpu.EnableMultithreadProtection(device); err != nil {
 		debugf("  DXVA 不可用（多线程保护失败）: %v", err)
+		if d.ownsDevice {
+			device.Release()
+			deviceCtx.Release()
+			d.ownsDevice = false
+		}
 		return
 	}
 	mgr, _, err := gpu.NewDXGIDeviceManager(device)
 	if err != nil {
 		debugf("  DXVA 不可用（建设备管理器失败）: %v", err)
+		if d.ownsDevice {
+			device.Release()
+			deviceCtx.Release()
+			d.ownsDevice = false
+		}
 		return
 	}
 	hr := d.transform.ProcessMessage(mf.MFT_MESSAGE_SET_D3D_MANAGER, uintptr(unsafe.Pointer(mgr)))
 	if d3d.HRESULT(hr).Failed() {
 		debugf("  DXVA 不可用（MFT 拒绝设备管理器）: %v", d3d.HRESULT(hr))
 		mgr.Release()
+		if d.ownsDevice {
+			device.Release()
+			deviceCtx.Release()
+			d.ownsDevice = false
+		}
 		return
 	}
-	// 设备管理器自己持有设备的引用，这里可以放心释放我们的那份。
 	d.devMgr = mgr
+	d.device = device
+	d.deviceCtx = deviceCtx
 	d.dxva = true
 	debugf("  DXVA 已启用（D3D11 设备管理器已交给解码器）")
 }
@@ -246,6 +281,17 @@ func (d *H264MFTDecoder) disableDXVA() {
 		d.devMgr.Release()
 		d.devMgr = nil
 	}
+	if d.ownsDevice {
+		if d.deviceCtx != nil {
+			d.deviceCtx.Release()
+		}
+		if d.device != nil {
+			d.device.Release()
+		}
+		d.ownsDevice = false
+	}
+	d.device = nil
+	d.deviceCtx = nil
 	d.dxva = false
 }
 
@@ -539,6 +585,9 @@ func (d *H264MFTDecoder) processOutput() (frame *DecodedFrame, more bool, err er
 }
 
 func (d *H264MFTDecoder) extractFrame(sample *mf.IMFSample) (*DecodedFrame, error) {
+	if d.dxva && d.device != nil && !d.ownsDevice {
+		return d.extractFrameGPU(sample)
+	}
 	var buf *mf.IMFMediaBuffer
 	if hr := sample.ConvertToContiguousBuffer(&buf); d3d.HRESULT(hr).Failed() {
 		return nil, fmt.Errorf("ConvertToContiguousBuffer: %w", d3d.HRESULT(hr))
@@ -563,6 +612,67 @@ func (d *H264MFTDecoder) extractFrame(sample *mf.IMFSample) (*DecodedFrame, erro
 		Subtype:   d.outSubtype,
 		Width:     d.outWidth,
 		Height:    d.outHeight,
+		Stride:    d.outStride,
+		Timestamp: time.Duration(ts * 100),
+		Duration:  time.Duration(dur * 100),
+	}, nil
+}
+
+func (d *H264MFTDecoder) extractFrameGPU(sample *mf.IMFSample) (*DecodedFrame, error) {
+	var buf *mf.IMFMediaBuffer
+	if hr := sample.GetBufferByIndex(0, &buf); d3d.HRESULT(hr).Failed() {
+		return nil, fmt.Errorf("GetBufferByIndex: %w", d3d.HRESULT(hr))
+	}
+	defer buf.Release()
+
+	var dxgiBuf *mf.IMFDXGIBuffer
+	if hr := buf.QueryInterface(mf.IID_IMFDXGIBuffer, &dxgiBuf); d3d.HRESULT(hr).Failed() {
+		return nil, fmt.Errorf("QueryInterface(IMFDXGIBuffer): %w", d3d.HRESULT(hr))
+	}
+	defer dxgiBuf.Release()
+
+	var srcTexPtr unsafe.Pointer
+	if hr := dxgiBuf.GetResource(d3d11.IID_ID3D11Texture2D, &srcTexPtr); d3d.HRESULT(hr).Failed() {
+		return nil, fmt.Errorf("GetResource(ID3D11Texture2D): %w", d3d.HRESULT(hr))
+	}
+	srcTex := (*d3d11.ID3D11Texture2D)(srcTexPtr)
+	defer srcTex.Release()
+
+	var subIdx uint32
+	dxgiBuf.GetSubresourceIndex(&subIdx)
+
+	var desc d3d11.D3D11_TEXTURE2D_DESC
+	srcTex.GetDesc(&desc)
+
+	copyDesc := d3d11.D3D11_TEXTURE2D_DESC{
+		Width:     desc.Width,
+		Height:    desc.Height,
+		MipLevels: 1,
+		ArraySize: 1,
+		Format:    desc.Format,
+		SampleDesc: dxgi.DXGI_SAMPLE_DESC{
+			Count:   1,
+			Quality: 0,
+		},
+		Usage:     d3d11.D3D11_USAGE_DEFAULT,
+		BindFlags: 0,
+	}
+	var privateTex *d3d11.ID3D11Texture2D
+	if hr := d.device.CreateTexture2D(&copyDesc, &privateTex); d3d.HRESULT(hr).Failed() {
+		return nil, fmt.Errorf("CreateTexture2D(copy): %w", d3d.HRESULT(hr))
+	}
+	d.deviceCtx.CopySubresourceRegion2D(privateTex, 0, 0, 0, 0, srcTex, subIdx, nil)
+
+	var ts, dur int64
+	sample.GetSampleTime(&ts)
+	sample.GetSampleDuration(&dur)
+
+	return &DecodedFrame{
+		Texture:   privateTex,
+		SubIndex:  0,
+		Subtype:   d.outSubtype,
+		Width:     desc.Width,
+		Height:    desc.Height,
 		Stride:    d.outStride,
 		Timestamp: time.Duration(ts * 100),
 		Duration:  time.Duration(dur * 100),
@@ -663,4 +773,15 @@ func (d *H264MFTDecoder) Release() {
 		d.transform.Release()
 		d.transform = nil
 	}
+	if d.ownsDevice {
+		if d.deviceCtx != nil {
+			d.deviceCtx.Release()
+		}
+		if d.device != nil {
+			d.device.Release()
+		}
+		d.ownsDevice = false
+	}
+	d.device = nil
+	d.deviceCtx = nil
 }

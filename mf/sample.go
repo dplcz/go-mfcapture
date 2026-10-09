@@ -132,6 +132,10 @@ type IMFMediaBuffer struct {
 	vtbl *IMFMediaBufferVtbl
 }
 
+func (obj *IMFMediaBuffer) QueryInterface(iid windows.GUID, pp interface{}) int32 {
+	return com.ReflectQueryInterface(obj, obj.vtbl.QueryInterface, &iid, pp)
+}
+
 func (obj *IMFMediaBuffer) Release() int32 {
 	ret, _, _ := syscall.SyscallN(obj.vtbl.Release, uintptr(unsafe.Pointer(obj)))
 	return int32(ret)

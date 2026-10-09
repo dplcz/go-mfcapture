@@ -3,16 +3,19 @@ package decode
 import (
 	"time"
 
+	"github.com/kirides/go-d3d/d3d11"
 	"golang.org/x/sys/windows"
 )
 
 // DecodedFrame 是一帧解码后的像素。
 type DecodedFrame struct {
-	Data      []byte       // 像素数据，布局由 Subtype 决定（NV12 时是 Y 平面 + 交错的 UV 平面）
-	Subtype   windows.GUID // 例如 mf.MFVideoFormat_NV12
-	Width     uint32
-	Height    uint32
-	Stride    int32 // 每行字节数；为 0 表示等于 Width（紧凑存放）
+	Data     []byte                 // CPU 路径：像素数据，布局由 Subtype 决定
+	Texture  *d3d11.ID3D11Texture2D // GPU 路径（DXVA）：非 nil 时调用方须 Release
+	SubIndex uint32                 // Texture 内的 subresource 索引
+	Subtype  windows.GUID
+	Width    uint32
+	Height   uint32
+	Stride   int32
 	Timestamp time.Duration
 	Duration  time.Duration
 }
