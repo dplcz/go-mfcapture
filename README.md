@@ -141,22 +141,58 @@ p.SetBitrate(4_000_000)
 
 ## Decoding (client side)
 
+推荐入口是 `decode.Session`——和采集侧的 `Pipeline` 对称：OS 线程绑定与 COM/MF
+初始化都收在 `Run` 内部，调用方什么都不用碰。
+
+```go
+sess, _ := decode.NewSession(decode.SessionConfig{
+    H264DecoderConfig: decode.H264DecoderConfig{
+        Width: 2560, Height: 1440,   // 来自 VideoDesc
+    },
+}, mySink)
+go func() { _ = sess.Run(ctx) }()   // Run 把调用 goroutine 绑到 OS 线程
+sess.Submit(accessUnit, pts, dur)   // 任意 goroutine 可调，只入队不阻塞解码
+sess.EndOfStream()                  // 输入结束：Run 排空解码器后返回 nil
+```
+
+- `Run` owns the OS thread and does all COM/MF init and teardown internally.
+  `NewSession` touches no COM at all. Decode, drain and every COM call happen on
+  that one thread, so there is no apartment mismatch.
+- `Submit` copies the AU and only enqueues; it returns `false` when the queue is
+  full or the session is closed. Dropping is the caller's decision — drop P
+  frames, keep IDRs.
+- `Sink.OnFrame` is called synchronously on the decode thread. Call
+  `DecodedFrame.Release()` once rendering has been submitted — from **any**
+  thread: the session marshals the release back onto the decode thread, so no COM
+  object is ever released cross-thread.
+- `EventReady` always precedes the first `OnFrame`. Width/height may still be 0
+  there (the decoder needs the SPS); the real size arrives as
+  `EventFormatChanged`.
+- `EventDegraded` means DXVA failed and the decoder was silently rebuilt in
+  software; `EventDecodeError` is a per-AU failure that does not stop the session.
+- Feed one **access unit** per `Submit` (in practice one `EncodedFrame` from the
+  host — the encoder emits whole AUs).
+- Output is uncompressed pixels, NV12 by default (`w*h*3/2` bytes per frame).
+- `MF_E_TRANSFORM_STREAM_CHANGE` (被控端改分辨率) is handled internally: the
+  output type is renegotiated and decoding continues (surfaced as
+  `EventFormatChanged`).
+- Resolution must be passed in (`-w/-h` in the demo). Without it some decoder
+  MFTs refuse input (`MF_E_NOTACCEPTING`); the client always knows the size
+  from `VideoDesc`, so this is not a problem in practice.
+
+直接用底层 `H264MFTDecoder` 也可以（想同步地"喂一个 AU 立刻拿帧"时）：
+
 ```go
 dec, _ := decode.NewH264MFTDecoder(decode.H264DecoderConfig{
-    Width: 2560, Height: 1440,   // 来自 VideoDesc
+    Width: 2560, Height: 1440,
 })
 frames, err := dec.Decode(accessUnit, pts, dur)   // 一次可能出 0 帧或多帧
 subtype, w, h, stride := dec.OutputFormat()       // 通常是 NV12 2560x1440
 ```
 
-- Feed one **access unit** per call (in practice one `EncodedFrame` from the
-  host — the encoder emits whole AUs).
-- Output is uncompressed pixels, NV12 by default (`w*h*3/2` bytes per frame).
-- `MF_E_TRANSFORM_STREAM_CHANGE` (被控端改分辨率) is handled internally: the
-  output type is renegotiated and decoding continues.
-- Resolution must be passed in (`-w/-h` in the demo). Without it some decoder
-  MFTs refuse input (`MF_E_NOTACCEPTING`); the client always knows the size
-  from `VideoDesc`, so this is not a problem in practice.
+但它**不绑定线程**：`New`/`Decode`/`Flush`/`Release` 必须全程发生在同一个已经
+`CoInitializeEx` + `MFStartup` 过的 OS 线程上——也就是说调用方要自己
+`runtime.LockOSThread()`（见 `cmd/mfdiag`）。做不到这一点请用 `Session`。
 
 ### 硬件加速（DXVA）
 
