@@ -45,16 +45,7 @@ type H264DecoderConfig struct {
 	DisableHardware bool
 }
 
-// DecodedFrame 是一帧解码后的像素。
-type DecodedFrame struct {
-	Data      []byte       // 像素数据，布局由 Subtype 决定（NV12 时是 Y 平面 + 交错的 UV 平面）
-	Subtype   windows.GUID // 例如 mf.MFVideoFormat_NV12
-	Width     uint32
-	Height    uint32
-	Stride    int32 // 每行字节数；为 0 表示等于 Width（紧凑存放）
-	Timestamp time.Duration
-	Duration  time.Duration
-}
+var _ Decoder = (*H264MFTDecoder)(nil)
 
 // H264MFTDecoder 包装一个 Media Foundation H264 解码器 MFT。
 // 支持同步与异步两种 MFT；默认把 D3D11 设备管理器交给它以启用 DXVA 硬件解码。
