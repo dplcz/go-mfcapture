@@ -242,6 +242,11 @@ func (s *Session) Run(ctx context.Context) error {
 		}
 		select {
 		case au := <-s.auCh:
+			// 先处理完所有已归还的帧再解码。select 在多个就绪分支间随机挑选，积压时
+			// （解码器刚建好、队列里攒了一批 AU）"解码新帧"与"归还旧帧"各占一半机会，
+			// 在飞帧数是个零漂移的随机游走，迟早超出 surface 池的空闲数，ProcessOutput
+			// 就等不到 surface 而永久阻塞——归还只能在本线程处理，此时本线程正卡在那里。
+			s.drainReturns()
 			s.decodeAU(dec, au)
 		case f := <-s.relCh:
 			// 渲染线程归还的帧：在解码线程上真正释放 COM 对象。

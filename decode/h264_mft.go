@@ -61,6 +61,16 @@ type H264DecoderConfig struct {
 	// 通过 MFT_MESSAGE_SET_D3D_MANAGER 把 D3D11 设备交给它——不交就内部退化成软件解码。
 	// 所以"开启硬件加速"的正确做法不是换 MFT，而是给它设备管理器。
 	DisableHardware bool
+	// DisableLowLatency 置 true 时不开启低延迟模式（MF_LOW_LATENCY）。
+	//
+	// 默认 false，即**默认低延迟**：解码器每输入一帧就输出一帧。不开的话，微软的 H264
+	// 解码器 MFT 会先攒满整个 DPB（实测约 16 帧）才开始输出——60fps 下凭空多出约 270ms
+	// 延迟；而且 DXVA 的 surface 池只按 DPB 大小分配，调用方一旦持有正在显示的那一帧，
+	// 解码器就等不到空闲 surface，ProcessOutput 永久阻塞（实测文件播放与网络流都能复现）。
+	//
+	// 低延迟模式假定码流没有 B 帧（输出顺序即解码顺序）。实时编码器（含本包的编码器）
+	// 的输出满足这一点；播放带 B 帧的普通视频文件时才需要关掉它。
+	DisableLowLatency bool
 	// Device/DeviceCtx 可选传入一个已有的 D3D11 设备。若非 nil，解码器复用该设备
 	// （不释放它），使解码器输出的纹理与调用方的渲染设备属于同一个 D3D11 Device，
 	// 实现零拷贝渲染。若为 nil，解码器自行创建并管理设备（向后兼容）。
@@ -197,6 +207,10 @@ func (d *H264MFTDecoder) configure(cfg H264DecoderConfig) error {
 			debugf("  D3D11-aware 读不到（通常意味着这是纯软件 MFT）")
 		}
 		attrs.SetUINT32(mf.MF_TRANSFORM_ASYNC_UNLOCK, 1)
+		// 低延迟必须在设置媒体类型之前打开，见 H264DecoderConfig.DisableLowLatency。
+		if !cfg.DisableLowLatency {
+			attrs.SetUINT32(mf.MF_LOW_LATENCY, 1)
+		}
 		attrs.Release()
 	}
 

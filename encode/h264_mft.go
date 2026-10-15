@@ -157,6 +157,18 @@ func (enc *H264MFTEncoder) configure(cfg H264EncoderConfig) error {
 		enc.isAsync = true
 	}
 
+	// Step 2b: GOP 必须在协商媒体类型之前设置。NVENC 的 MFT 在类型确定后会忽略
+	// CODECAPI_AVEncMPVGOPSize（实测 GOP=10 时只有首帧是 IDR，之后再无关键帧），
+	// 而远程桌面恰恰依赖周期性关键帧兜底丢包恢复。
+	var codecAPI *mf.ICodecAPI
+	qiHr = int32(enc.transform.QueryInterface(mf.IID_ICodecAPI, &codecAPI))
+	if !d3d.HRESULT(qiHr).Failed() && codecAPI != nil {
+		enc.codecAPI = codecAPI
+		if cfg.GOPSize > 0 {
+			codecAPI.SetUINT32(mf.CODECAPI_AVEncMPVGOPSize, cfg.GOPSize)
+		}
+	}
+
 	// Step 3: Set output type (H264).
 	outType, err := mf.NewOutputMediaType(cfg.Width, cfg.Height, cfg.FPSNum, cfg.FPSDen, cfg.BitrateBps)
 	if err != nil {
@@ -204,18 +216,12 @@ func (enc *H264MFTEncoder) configure(cfg H264EncoderConfig) error {
 		enc.outputBufSize = 1024 * 1024
 	}
 
-	// Step 7: Configure codec properties via ICodecAPI.
-	var codecAPI *mf.ICodecAPI
-	qiHr = int32(enc.transform.QueryInterface(mf.IID_ICodecAPI, &codecAPI))
-	if !d3d.HRESULT(qiHr).Failed() && codecAPI != nil {
-		enc.codecAPI = codecAPI
+	// Step 7: Configure codec properties via ICodecAPI (GOP was set in step 2b).
+	if codecAPI := enc.codecAPI; codecAPI != nil {
 		codecAPI.SetUINT32(mf.CODECAPI_AVEncCommonRateControlMode, mf.EAVEncCommonRateControlMode_CBR)
 		codecAPI.SetUINT32(mf.CODECAPI_AVEncCommonMeanBitRate, cfg.BitrateBps)
 		if cfg.LowLatency {
 			codecAPI.SetBool(mf.CODECAPI_AVLowLatencyMode, true)
-		}
-		if cfg.GOPSize > 0 {
-			codecAPI.SetUINT32(mf.CODECAPI_AVEncMPVGOPSize, cfg.GOPSize)
 		}
 	}
 
