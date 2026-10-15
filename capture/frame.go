@@ -22,7 +22,7 @@ type CursorInfo struct {
 	ID       uint64 // HCURSOR handle value, used as cache key
 	IsNew    bool   // true = first occurrence of this shape
 	// Populated only when IsNew == true
-	Shape   []byte // BGRA pixel data (top-down)
+	Shape   []byte // BGRA pixel data (top-down, straight alpha; see cursorToBGRA)
 	Width   int
 	Height  int
 	HotSpot image.Point

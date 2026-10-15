@@ -188,24 +188,24 @@ func extractCursorBitmap(hCursor uintptr) (shape []byte, w, h, hotX, hotY int, o
 	hotX = int(ii.xHotspot)
 	hotY = int(ii.yHotspot)
 
-	hbm := ii.hbmColor
-	if hbm == 0 {
-		hbm = ii.hbmMask
-	}
-
-	var bm bitmap
-	ret, _, _ = pGetBitmapInfo.Call(hbm, uintptr(unsafe.Sizeof(bm)), uintptr(unsafe.Pointer(&bm)))
-	if ret == 0 || bm.bmWidth == 0 || bm.bmHeight == 0 {
+	if ii.hbmMask == 0 {
 		return
 	}
-
+	var bm bitmap
+	ret, _, _ = pGetBitmapInfo.Call(ii.hbmMask, uintptr(unsafe.Sizeof(bm)), uintptr(unsafe.Pointer(&bm)))
+	if ret == 0 || bm.bmWidth <= 0 || bm.bmHeight <= 0 {
+		return
+	}
 	w = int(bm.bmWidth)
 	h = int(bm.bmHeight)
-
+	maskH := h
 	// For monochrome cursors (no hbmColor), the mask bitmap is double-height:
-	// top half = AND mask, bottom half = XOR mask. We use only the visible height.
+	// top half = AND mask, bottom half = XOR mask.
 	if ii.hbmColor == 0 {
-		h = h / 2
+		h /= 2
+		if h == 0 {
+			return
+		}
 	}
 
 	hdc, _, _ := pGetDC.Call(0)
@@ -220,6 +220,25 @@ func extractCursorBitmap(hCursor uintptr) (shape []byte, w, h, hotX, hotY int, o
 	}
 	defer pDeleteDC.Call(memDC)
 
+	// Both bitmaps are read in full as 32bpp top-down DIBs; 1bpp masks expand to
+	// black (bit 0) / white (bit 1).
+	mask := readDIB32(memDC, ii.hbmMask, w, maskH)
+	if mask == nil {
+		return
+	}
+	var color []byte
+	if ii.hbmColor != 0 {
+		if color = readDIB32(memDC, ii.hbmColor, w, h); color == nil {
+			return
+		}
+	}
+
+	shape = cursorToBGRA(color, mask, w, h)
+	ok = true
+	return
+}
+
+func readDIB32(dc, hbm uintptr, w, h int) []byte {
 	var bih bitmapInfoHeader
 	bih.biSize = uint32(unsafe.Sizeof(bih))
 	bih.biWidth = int32(w)
@@ -228,20 +247,107 @@ func extractCursorBitmap(hCursor uintptr) (shape []byte, w, h, hotX, hotY int, o
 	bih.biBitCount = 32
 	bih.biCompression = bi_RGB
 
-	shape = make([]byte, w*h*4)
-	ret, _, _ = pGetDIBits.Call(
-		memDC,
+	buf := make([]byte, w*h*4)
+	ret, _, _ := pGetDIBits.Call(
+		dc,
 		hbm,
 		0,
 		uintptr(h),
-		uintptr(unsafe.Pointer(&shape[0])),
+		uintptr(unsafe.Pointer(&buf[0])),
 		uintptr(unsafe.Pointer(&bih)),
 		dib_RGB_COLORS,
 	)
-	if ret == 0 {
-		return nil, 0, 0, 0, 0, false
+	if int(ret) != h {
+		return nil
+	}
+	return buf
+}
+
+// cursorToBGRA turns the GDI cursor bitmaps into BGRA with straight
+// (non-premultiplied) alpha, which is what CursorInfo.Shape carries.
+//
+// color is the 32bpp color bitmap (nil for monochrome cursors). mask is the
+// AND mask expanded to 32bpp; for monochrome cursors it is double-height with
+// the XOR mask in the bottom half. Both are top-down, w*h pixels (mask w*2h).
+//
+// Three kinds of cursor exist:
+//
+//   - 32bpp color with an alpha channel (most modern cursors): used as is;
+//     Windows ignores the mask for these too.
+//   - color without alpha: AND bit 0 = opaque color pixel; AND bit 1 = the
+//     color pixel is XORed onto the screen (black = transparent, else invert).
+//   - monochrome: AND/XOR bit pairs 00 = black, 01 = white, 10 = transparent,
+//     11 = invert the screen (the classic I-beam and crosshair are all invert).
+//
+// Screen inversion cannot be expressed in BGRA. Inverting pixels become black
+// with a one-pixel white outline, so the cursor stays visible on both dark and
+// light content (the same approximation WebRTC's desktop capture uses).
+func cursorToBGRA(color, mask []byte, w, h int) []byte {
+	n := w * h
+	out := make([]byte, n*4)
+	if color != nil {
+		copy(out, color)
+		for i := range n {
+			if out[i*4+3] != 0 {
+				return out // has an alpha channel
+			}
+		}
 	}
 
-	ok = true
-	return
+	invert := make([]bool, n)
+	inverted := false
+	for i := range n {
+		p := out[i*4 : i*4+4]
+		and := mask[i*4] != 0
+		var opaque, white, inv bool
+		if color != nil {
+			nonBlack := p[0]|p[1]|p[2] != 0
+			opaque, inv = !and, and && nonBlack
+		} else {
+			xor := mask[(n+i)*4] != 0
+			opaque, white, inv = !and, !and && xor, and && xor
+		}
+		switch {
+		case inv:
+			p[0], p[1], p[2], p[3] = 0, 0, 0, 0xFF
+			invert[i], inverted = true, true
+		case opaque && color == nil:
+			v := byte(0)
+			if white {
+				v = 0xFF
+			}
+			p[0], p[1], p[2], p[3] = v, v, v, 0xFF
+		case opaque:
+			p[3] = 0xFF
+		default:
+			p[0], p[1], p[2], p[3] = 0, 0, 0, 0
+		}
+	}
+	if !inverted {
+		return out
+	}
+
+	// Outline: transparent pixels next to (8-neighborhood) an inverting pixel turn white.
+	for y := range h {
+		for x := range w {
+			i := y*w + x
+			if out[i*4+3] != 0 || !hasNeighbor(invert, w, h, x, y) {
+				continue
+			}
+			out[i*4], out[i*4+1], out[i*4+2], out[i*4+3] = 0xFF, 0xFF, 0xFF, 0xFF
+		}
+	}
+	return out
+}
+
+func hasNeighbor(set []bool, w, h, x, y int) bool {
+	for dy := -1; dy <= 1; dy++ {
+		for dx := -1; dx <= 1; dx++ {
+			nx, ny := x+dx, y+dy
+			if (dx != 0 || dy != 0) && nx >= 0 && ny >= 0 && nx < w && ny < h && set[ny*w+nx] {
+				return true
+			}
+		}
+	}
+	return false
 }
