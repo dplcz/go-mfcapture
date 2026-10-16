@@ -136,10 +136,7 @@ func Record(ctx context.Context, cfg Config) error {
 		return fmt.Errorf("BeginWriting: %w", d3d.HRESULT(hr))
 	}
 
-	var minFrameIntervalHns int64
-	if cfg.MaxFPS > 0 {
-		minFrameIntervalHns = int64(10_000_000) / int64(cfg.MaxFPS)
-	}
+	limiter := newFrameLimiter(cfg.MaxFPS)
 
 	start := time.Now()
 	deadline := start.Add(cfg.Duration)
@@ -170,7 +167,7 @@ loop:
 		}
 
 		hns := now.Sub(start).Nanoseconds() / 100
-		if minFrameIntervalHns > 0 && lastHns >= 0 && hns-lastHns < minFrameIntervalHns {
+		if !limiter.allow(hns) {
 			continue
 		}
 

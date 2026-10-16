@@ -101,7 +101,7 @@ type Stats struct {
 type PipelineConfig struct {
 	Output     uint   // 显示器索引，取值来自 capture.EnumMonitors() 的 Index
 	BitrateBps uint32 // 目标码率；0 = 8 Mbps
-	// MaxFPS 是写入帧率上限，0 = 不限。
+	// MaxFPS 是写入帧率上限，0 = 不限。按固定节拍限流，允许帧比节拍早到 10% 个间隔。
 	//
 	// 注意：编码器是按 FPSNum/FPSDen 声明的帧率给每帧分配码率预算的。若 MaxFPS=0 而
 	// 屏幕实际变化很快，真实帧率会远高于 FPSNum，实际码率 ≈ BitrateBps × (实际fps/FPSNum)。
@@ -316,10 +316,7 @@ func (p *Pipeline) Run(ctx context.Context) error {
 	go p.cursorMon.Start(cursorCtx)
 	defer p.cursorMon.Stop()
 
-	var minFrameIntervalHns int64
-	if p.cfg.MaxFPS > 0 {
-		minFrameIntervalHns = int64(10_000_000) / int64(p.cfg.MaxFPS)
-	}
+	limiter := newFrameLimiter(p.cfg.MaxFPS)
 
 	start := time.Now()
 	lastHns := int64(-1)
@@ -347,7 +344,7 @@ func (p *Pipeline) Run(ctx context.Context) error {
 		}
 
 		hns := time.Since(start).Nanoseconds() / 100
-		if minFrameIntervalHns > 0 && lastHns >= 0 && hns-lastHns < minFrameIntervalHns {
+		if !limiter.allow(hns) {
 			continue
 		}
 
