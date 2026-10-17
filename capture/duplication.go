@@ -3,6 +3,7 @@ package capture
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 	"time"
 	"unsafe"
 
@@ -20,6 +21,13 @@ var ErrTimeout = errors.New("mfcapture/capture: no new frame within timeout")
 // an IDR frame from the encoder.
 var ErrAccessLostRecovered = errors.New("mfcapture/capture: duplication recreated after ACCESS_LOST")
 
+// ErrCaptureUnavailable means the desktop duplication endpoint is temporarily
+// unavailable (for example while Windows is showing the secure/lock screen).
+// Callers should keep the pipeline alive and retry after a short delay.
+var ErrCaptureUnavailable = errors.New("mfcapture/capture: desktop duplication temporarily unavailable")
+
+var errAccessDenied = d3d.HRESULT(0x80070005)
+
 // Duplicator wraps DXGI Desktop Duplication, implementing the Capturer interface.
 // It copies each new desktop frame GPU→GPU into a caller-owned texture, extracts
 // cursor info, and automatically recovers from DXGI_ERROR_ACCESS_LOST.
@@ -29,9 +37,15 @@ type Duplicator struct {
 	outputDuplication *dxgi.IDXGIOutputDuplication
 	dxgiOutput        *dxgi.IDXGIOutput5
 	acquiredFrame     bool
-	outputIndex       uint
+	// A deferred ReleaseFrame can fail after AcquireFrame has produced a frame.
+	// Preserve that result independently of diagnostics until the next acquire.
+	frameReleaseHR d3d.HRESULT
+	outputIndex    uint
+	diag           duplicationDiagnostics
 
 	privTex *d3d11.ID3D11Texture2D
+	privW   uint32
+	privH   uint32
 	start   time.Time
 
 	width, height uint32
@@ -48,8 +62,12 @@ func NewDuplicator(device *d3d11.ID3D11Device, deviceCtx *d3d11.ID3D11DeviceCont
 		deviceCtx:   deviceCtx,
 		outputIndex: output,
 		start:       time.Now(),
+		diag:        newDuplicationDiagnostics(),
 	}
 	if err := dup.initDuplication(); err != nil {
+		if errors.Is(err, errAccessDenied) {
+			return nil, fmt.Errorf("%w: %w", ErrCaptureUnavailable, err)
+		}
 		return nil, err
 	}
 	if err := dup.initPrivateTexture(); err != nil {
@@ -92,7 +110,9 @@ func (d *Duplicator) initDuplication() error {
 	hr = dxgiOutput5.DuplicateOutput1(dxgiDevice1, 0, []dxgi.DXGI_FORMAT{
 		dxgi.DXGI_FORMAT_B8G8R8A8_UNORM,
 	}, &dup)
+	api := "DuplicateOutput1"
 	if d3d.HRESULT(hr).Failed() {
+		d.logDXGI(slog.LevelDebug, api, d3d.HRESULT(hr), slog.String("phase", "fallback"))
 		var dxgiOutput1 *dxgi.IDXGIOutput1
 		hr2 := dxgiOutput.QueryInterface(dxgi.IID_IDXGIOutput1, &dxgiOutput1)
 		if d3d.HRESULT(hr2).Failed() {
@@ -101,7 +121,9 @@ func (d *Duplicator) initDuplication() error {
 		}
 		defer dxgiOutput1.Release()
 		hr = dxgiOutput1.DuplicateOutput(dxgiDevice1, &dup)
+		api = "DuplicateOutput"
 		if d3d.HRESULT(hr).Failed() {
+			d.logDXGI(slog.LevelDebug, api, d3d.HRESULT(hr), slog.String("phase", "failed"))
 			dxgiOutput5.Release()
 			return fmt.Errorf("DuplicateOutput: %w", d3d.HRESULT(hr))
 		}
@@ -118,6 +140,10 @@ func (d *Duplicator) initDuplication() error {
 	d.dxgiOutput = dxgiOutput5
 	d.width = uint32(outDesc.DesktopCoordinates.Right - outDesc.DesktopCoordinates.Left)
 	d.height = uint32(outDesc.DesktopCoordinates.Bottom - outDesc.DesktopCoordinates.Top)
+	d.diag.generation++
+	d.logDXGI(slog.LevelInfo, api, d3d.S_OK,
+		slog.String("phase", "created"),
+		slog.Uint64("width", uint64(d.width)), slog.Uint64("height", uint64(d.height)))
 	return nil
 }
 
@@ -140,6 +166,8 @@ func (d *Duplicator) initPrivateTexture() error {
 		d.privTex.Release()
 	}
 	d.privTex = tex
+	d.privW = d.width
+	d.privH = d.height
 	return nil
 }
 
@@ -151,6 +179,7 @@ const (
 func (d *Duplicator) releaseDuplication() {
 	d.releaseFrame()
 	if d.outputDuplication != nil {
+		d.logDXGI(slog.LevelInfo, "ReleaseDuplication", d3d.S_OK, slog.String("phase", "before_release"))
 		d.outputDuplication.Release()
 		d.outputDuplication = nil
 	}
@@ -158,27 +187,42 @@ func (d *Duplicator) releaseDuplication() {
 		d.dxgiOutput.Release()
 		d.dxgiOutput = nil
 	}
+	d.frameReleaseHR = d3d.S_OK
 }
 
 func (d *Duplicator) releaseFrame() {
-	if d.acquiredFrame {
-		d.outputDuplication.ReleaseFrame()
-		d.acquiredFrame = false
+	if d.acquiredFrame && d.outputDuplication != nil {
+		hr := d3d.HRESULT(d.outputDuplication.ReleaseFrame())
+		d.frameReleaseHR = hr
+		d.diag.lastReleaseSeq = d.diag.acquireSeq
+		d.diag.lastReleaseGeneration = d.diag.generation
+		d.diag.lastReleaseHR = hr
+		level := slog.LevelDebug
+		if hr == d3d.DXGI_ERROR_ACCESS_LOST {
+			level = slog.LevelInfo
+		} else if hr.Failed() {
+			level = slog.LevelWarn
+		}
+		// The next acquire handles a failed release before reusing duplication.
+		// These flags describe Go state, not DXGI's actual frame ownership.
+		d.logDXGI(level, "ReleaseFrame", hr, slog.Bool("local_owns_frame_after", false))
 	}
+	d.acquiredFrame = false
 }
 
 func (d *Duplicator) recreate() error {
-	oldW, oldH := d.width, d.height
+	d.logDXGI(slog.LevelDebug, "Recreate", d3d.S_OK, slog.String("phase", "begin"))
 	d.releaseDuplication()
 	if err := d.initDuplication(); err != nil {
 		return err
 	}
-	if d.width != oldW || d.height != oldH {
+	if d.privTex == nil || d.privW != d.width || d.privH != d.height {
 		if err := d.initPrivateTexture(); err != nil {
 			d.releaseDuplication()
 			return err
 		}
 	}
+	d.logDXGI(slog.LevelInfo, "Recreate", d3d.S_OK, slog.String("phase", "complete"))
 	return nil
 }
 
@@ -189,11 +233,38 @@ func (d *Duplicator) AcquireFrame(timeoutMs uint32) (*CapturedFrame, error) {
 	var desktop *dxgi.IDXGIResource
 
 	d.releaseFrame()
+	if d.frameReleaseHR.Failed() && d.frameReleaseHR != d3d.DXGI_ERROR_ACCESS_LOST {
+		return nil, fmt.Errorf("ReleaseFrame: %w", d.frameReleaseHR)
+	}
+	if d.outputDuplication == nil || d.frameReleaseHR == d3d.DXGI_ERROR_ACCESS_LOST {
+		if err := d.recreate(); err != nil {
+			if errors.Is(err, errAccessDenied) {
+				return nil, fmt.Errorf("%w: %w", ErrCaptureUnavailable, err)
+			}
+			return nil, fmt.Errorf("recreate lost or unavailable duplication: %w", err)
+		}
+		return nil, ErrAccessLostRecovered
+	}
+	d.diag.acquireSeq++
 	hrF := d.outputDuplication.AcquireNextFrame(timeoutMs, &frameInfo, &desktop)
 	hr := d3d.HRESULT(hrF)
+	level := slog.LevelDebug
+	if hr == d3d.DXGI_ERROR_ACCESS_LOST {
+		level = slog.LevelInfo
+	} else if hr.Failed() && hr != d3d.DXGI_ERROR_WAIT_TIMEOUT {
+		level = slog.LevelWarn
+	}
+	d.logDXGI(level, "AcquireNextFrame", hr,
+		slog.Uint64("timeout_ms", uint64(timeoutMs)),
+		slog.Uint64("accumulated_frames", uint64(frameInfo.AccumulatedFrames)),
+		slog.String("desktop_resource", fmt.Sprintf("%p", desktop)),
+		slog.Bool("local_owns_frame_after", !hr.Failed()))
 
 	if errors.Is(hr, d3d.DXGI_ERROR_ACCESS_LOST) {
 		if err := d.recreate(); err != nil {
+			if errors.Is(err, errAccessDenied) {
+				return nil, fmt.Errorf("%w: %w", ErrCaptureUnavailable, err)
+			}
 			return nil, fmt.Errorf("recreate after ACCESS_LOST: %w", err)
 		}
 		return nil, ErrAccessLostRecovered
@@ -239,4 +310,5 @@ func (d *Duplicator) Release() {
 		d.privTex.Release()
 		d.privTex = nil
 	}
+	d.privW, d.privH = 0, 0
 }

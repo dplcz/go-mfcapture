@@ -236,7 +236,23 @@ func (p *Pipeline) Close() error {
 	return nil
 }
 
-const acquireTimeoutMs = 500
+const (
+	acquireTimeoutMs  = 500
+	captureRetryDelay = 250 * time.Millisecond
+)
+
+// waitCaptureRetry waits before retrying a temporarily unavailable desktop
+// duplication session, while still allowing Run to stop promptly.
+func waitCaptureRetry(ctx context.Context) error {
+	timer := time.NewTimer(captureRetryDelay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
 
 // Run 在调用方 goroutine 上运行整条管线，直到 ctx 被取消。它是阻塞的。
 //
@@ -279,9 +295,21 @@ func (p *Pipeline) Run(ctx context.Context) error {
 	}
 	p.devMgr, p.resetTok = devMgr, resetTok
 
-	dup, err := capture.NewDuplicator(device, deviceCtx, p.cfg.Output)
-	if err != nil {
-		return fmt.Errorf("NewDuplicator: %w", err)
+	var dup *capture.Duplicator
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		dup, err = capture.NewDuplicator(device, deviceCtx, p.cfg.Output)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, capture.ErrCaptureUnavailable) {
+			return fmt.Errorf("NewDuplicator: %w", err)
+		}
+		if err := waitCaptureRetry(ctx); err != nil {
+			return err
+		}
 	}
 	defer dup.Release()
 	p.capturer = dup
@@ -333,10 +361,19 @@ func (p *Pipeline) Run(ctx context.Context) error {
 			if errors.Is(err, capture.ErrTimeout) {
 				continue
 			}
+			if errors.Is(err, capture.ErrCaptureUnavailable) {
+				if err := waitCaptureRetry(ctx); err != nil {
+					return err
+				}
+				continue
+			}
 			if errors.Is(err, capture.ErrAccessLostRecovered) {
 				// 采集会话已重建（锁屏/分辨率/模式变化）。分辨率可能变了，
 				// 编码器输入类型必须跟着重建，否则后续每帧都会失败。
-				p.handleResolutionChange()
+				if err := p.handleResolutionChange(); err != nil {
+					return err
+				}
+				_ = p.encoder.ForceKeyFrame()
 				continue
 			}
 			p.sink.OnEvent(Event{Kind: EventCaptureError, Err: err})
@@ -402,15 +439,15 @@ func (p *Pipeline) buildEncoder(width, height uint32) error {
 }
 
 // handleResolutionChange 在 ACCESS_LOST 恢复后按需重建编码器并上报新分辨率。
-func (p *Pipeline) handleResolutionChange() {
+func (p *Pipeline) handleResolutionChange() error {
 	w, h := p.capturer.Width(), p.capturer.Height()
 	old := p.Desc()
 	if w == old.Width && h == old.Height {
-		return
+		return nil
 	}
 	if err := p.buildEncoder(w, h); err != nil {
 		p.sink.OnEvent(Event{Kind: EventCaptureError, Err: err})
-		return
+		return err
 	}
 	p.hw.Store(p.encoder.IsHardware)
 	p.setDesc(VideoDesc{
@@ -422,6 +459,7 @@ func (p *Pipeline) handleResolutionChange() {
 		StreamFormat: StreamFormatAnnexB,
 	})
 	p.sink.OnEvent(Event{Kind: EventResolutionChanged, Desc: p.Desc()})
+	return nil
 }
 
 // drainCommands 处理上层投递过来的控制命令。只能在 Run 所在 goroutine 调用。

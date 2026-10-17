@@ -33,11 +33,13 @@ type H264MFTEncoder struct {
 	devManager *mf.IMFDXGIDeviceManager
 	eventGen   *mf.IMFMediaEventGenerator
 
-	width, height   uint32
-	IsHardware      bool
-	isAsync         bool
-	providesSamples bool
-	outputBufSize   uint32
+	width, height      uint32
+	IsHardware         bool
+	isAsync            bool
+	providesSamples    bool
+	outputBufSize      uint32
+	beginStreamingSent bool
+	startOfStreamSent  bool
 
 	mu           sync.Mutex
 	forceNextIDR bool
@@ -70,7 +72,7 @@ func NewH264MFTEncoder(cfg H264EncoderConfig, device *d3d11.ID3D11Device, devMan
 	}
 
 	if err := enc.configure(cfg); err != nil {
-		transform.Release()
+		enc.Release()
 		return nil, err
 	}
 
@@ -123,9 +125,7 @@ func activateFirst(activates []*mf.IMFActivate) (*mf.IMFTransform, error) {
 	var lastErr error
 	for i, act := range activates {
 		hr := act.ActivateObject(mf.IID_IMFTransform, unsafe.Pointer(&transform))
-		if i > 0 || d3d.HRESULT(hr).Failed() {
-			act.Release()
-		}
+		act.Release()
 		if d3d.HRESULT(hr).Failed() {
 			lastErr = fmt.Errorf("ActivateObject: %w", d3d.HRESULT(hr))
 			continue
@@ -226,8 +226,14 @@ func (enc *H264MFTEncoder) configure(cfg H264EncoderConfig) error {
 	}
 
 	// Step 8: Notify the MFT that streaming is about to begin.
-	enc.transform.ProcessMessage(mf.MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0)
-	enc.transform.ProcessMessage(mf.MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0)
+	if hr := enc.transform.ProcessMessage(mf.MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0); d3d.HRESULT(hr).Failed() {
+		return fmt.Errorf("ProcessMessage(NOTIFY_BEGIN_STREAMING): %w", d3d.HRESULT(hr))
+	}
+	enc.beginStreamingSent = true
+	if hr := enc.transform.ProcessMessage(mf.MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0); d3d.HRESULT(hr).Failed() {
+		return fmt.Errorf("ProcessMessage(NOTIFY_START_OF_STREAM): %w", d3d.HRESULT(hr))
+	}
+	enc.startOfStreamSent = true
 
 	return nil
 }
@@ -475,6 +481,16 @@ func (enc *H264MFTEncoder) Flush() ([]*EncodedFrame, error) {
 
 // Release frees all COM resources.
 func (enc *H264MFTEncoder) Release() {
+	if enc.transform != nil {
+		if enc.startOfStreamSent {
+			enc.transform.ProcessMessage(mf.MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0)
+			enc.startOfStreamSent = false
+		}
+		if enc.beginStreamingSent {
+			enc.transform.ProcessMessage(mf.MFT_MESSAGE_NOTIFY_END_STREAMING, 0)
+			enc.beginStreamingSent = false
+		}
+	}
 	if enc.codecAPI != nil {
 		enc.codecAPI.Release()
 		enc.codecAPI = nil
@@ -484,8 +500,6 @@ func (enc *H264MFTEncoder) Release() {
 		enc.eventGen = nil
 	}
 	if enc.transform != nil {
-		enc.transform.ProcessMessage(mf.MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0)
-		enc.transform.ProcessMessage(mf.MFT_MESSAGE_NOTIFY_END_STREAMING, 0)
 		enc.transform.Release()
 		enc.transform = nil
 	}
