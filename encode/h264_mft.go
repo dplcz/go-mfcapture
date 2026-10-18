@@ -2,6 +2,7 @@ package encode
 
 import (
 	"fmt"
+	"log/slog"
 	"sync"
 	"time"
 	"unsafe"
@@ -40,6 +41,13 @@ type H264MFTEncoder struct {
 	outputBufSize      uint32
 	beginStreamingSent bool
 	startOfStreamSent  bool
+	// Async notifications are credits, not hints. A call that reports a format
+	// change still consumes its HaveOutput credit.
+	pendingNeedInput   uint32
+	pendingHaveOutput  uint32
+	asyncStreamChanges int
+	lastAsyncEvent     uint32
+	pendingFrames      []*EncodedFrame
 
 	mu           sync.Mutex
 	forceNextIDR bool
@@ -208,12 +216,8 @@ func (enc *H264MFTEncoder) configure(cfg H264EncoderConfig) error {
 	}
 
 	// Step 6: Query output stream info for buffer allocation strategy.
-	var streamInfo mf.MFT_OUTPUT_STREAM_INFO
-	enc.transform.GetOutputStreamInfo(0, &streamInfo)
-	enc.providesSamples = (streamInfo.DwFlags & mf.MFT_OUTPUT_STREAM_PROVIDES_SAMPLES) != 0
-	enc.outputBufSize = streamInfo.CbSize
-	if enc.outputBufSize == 0 {
-		enc.outputBufSize = 1024 * 1024
+	if err := enc.refreshOutputStreamInfo(); err != nil {
+		return err
 	}
 
 	// Step 7: Configure codec properties via ICodecAPI (GOP was set in step 2b).
@@ -234,6 +238,9 @@ func (enc *H264MFTEncoder) configure(cfg H264EncoderConfig) error {
 		return fmt.Errorf("ProcessMessage(NOTIFY_START_OF_STREAM): %w", d3d.HRESULT(hr))
 	}
 	enc.startOfStreamSent = true
+	slog.Info("encoder configured", "hardware", enc.IsHardware, "async", enc.isAsync,
+		"width", enc.width, "height", enc.height, "provides_samples", enc.providesSamples,
+		"buffer_size", enc.outputBufSize)
 
 	return nil
 }
@@ -288,48 +295,84 @@ func (enc *H264MFTEncoder) encodeSync(sample *mf.IMFSample) (*EncodedFrame, erro
 	return enc.processOutput()
 }
 
-// encodeAsync uses the event-driven model required by async hardware MFTs:
-// wait for METransformNeedInput → ProcessInput → wait for METransformHaveOutput → ProcessOutput.
+// encodeAsync retains every input/output notification. Output can arrive while
+// waiting for input, and NeedInput can arrive before a submitted frame produces
+// output. Neither notification may be discarded.
 func (enc *H264MFTEncoder) encodeAsync(sample *mf.IMFSample) (*EncodedFrame, error) {
-	// Drain any pending METransformNeedInput event.
-	if err := enc.waitForEventType(mf.METransformNeedInput); err != nil {
-		return nil, fmt.Errorf("waiting for NeedInput: %w", err)
+	for enc.pendingNeedInput == 0 {
+		if enc.pendingHaveOutput > 0 {
+			frame, err := enc.processOutput()
+			if err != nil {
+				return nil, err
+			}
+			if frame != nil {
+				enc.pendingFrames = append(enc.pendingFrames, frame)
+			}
+			continue
+		}
+		if err := enc.readAsyncEventForEncode(); err != nil {
+			return nil, err
+		}
 	}
 
+	enc.pendingNeedInput--
 	hr := enc.transform.ProcessInput(0, sample, 0)
 	if d3d.HRESULT(hr).Failed() {
 		return nil, fmt.Errorf("ProcessInput: %w", d3d.HRESULT(hr))
 	}
 
-	// Poll for METransformHaveOutput. The encoder may not have output ready yet
-	// (it may need more input), so use a non-blocking check first, then block.
-	eventType, err := enc.getNextEventType()
-	if err != nil {
-		return nil, fmt.Errorf("getNextEventType: %w", err)
+	if len(enc.pendingFrames) > 0 {
+		frame := enc.pendingFrames[0]
+		enc.pendingFrames[0] = nil
+		enc.pendingFrames = enc.pendingFrames[1:]
+		return frame, nil
 	}
 
-	if eventType == mf.METransformHaveOutput {
-		return enc.processOutput()
+	for {
+		if enc.pendingHaveOutput > 0 {
+			frame, err := enc.processOutput()
+			if err != nil || frame != nil {
+				return frame, err
+			}
+			// A format change consumes one output event. Return to the event
+			// loop before trying again; the MFT might request more input.
+			continue
+		}
+		if enc.pendingNeedInput > 0 {
+			return nil, nil
+		}
+		if err := enc.readAsyncEventForEncode(); err != nil {
+			return nil, err
+		}
 	}
-	// METransformNeedInput or other event — no output yet.
-	return nil, nil
 }
 
-// waitForEventType blocks until the specified event type arrives, consuming other events.
-func (enc *H264MFTEncoder) waitForEventType(target uint32) error {
-	for {
-		var event *mf.IMFMediaEvent
-		hr := enc.eventGen.GetEvent(0, &event)
-		if d3d.HRESULT(hr).Failed() {
-			return fmt.Errorf("GetEvent: %w", d3d.HRESULT(hr))
-		}
-		var et uint32
-		event.GetType(&et)
-		event.Release()
-		if et == target {
-			return nil
-		}
+func (enc *H264MFTEncoder) readAsyncEventForEncode() error {
+	et, err := enc.readAsyncEvent()
+	if err != nil {
+		return err
 	}
+	if et == mf.METransformDrainComplete {
+		return fmt.Errorf("unexpected METransformDrainComplete during Encode")
+	}
+	return nil
+}
+
+func (enc *H264MFTEncoder) readAsyncEvent() (uint32, error) {
+	et, err := enc.getNextEventType()
+	if err != nil {
+		return 0, err
+	}
+	enc.lastAsyncEvent = et
+	switch et {
+	case mf.METransformNeedInput:
+		enc.pendingNeedInput++
+	case mf.METransformHaveOutput:
+		enc.pendingHaveOutput++
+	}
+	slog.Debug("encoder event", "type", et, "pending_input", enc.pendingNeedInput,
+		"pending_output", enc.pendingHaveOutput)
+	return et, nil
 }
 
 // getNextEventType blocks and returns the type of the next event.
@@ -339,56 +382,175 @@ func (enc *H264MFTEncoder) getNextEventType() (uint32, error) {
 	if d3d.HRESULT(hr).Failed() {
 		return 0, fmt.Errorf("GetEvent: %w", d3d.HRESULT(hr))
 	}
+	if event == nil {
+		return 0, fmt.Errorf("GetEvent returned no event")
+	}
+	defer event.Release()
 	var et uint32
-	event.GetType(&et)
-	event.Release()
+	if hr := event.GetType(&et); d3d.HRESULT(hr).Failed() {
+		return 0, fmt.Errorf("event.GetType: %w", d3d.HRESULT(hr))
+	}
+	var status int32
+	if hr := event.GetStatus(&status); d3d.HRESULT(hr).Failed() {
+		return 0, fmt.Errorf("event.GetStatus(type=%d): %w", et, d3d.HRESULT(hr))
+	}
+	if d3d.HRESULT(status).Failed() {
+		return 0, fmt.Errorf("encoder event(type=%d): %w", et, d3d.HRESULT(status))
+	}
 	return et, nil
 }
 
-// processOutput calls ProcessOutput with correct buffer allocation strategy.
+func (enc *H264MFTEncoder) refreshOutputStreamInfo() error {
+	var info mf.MFT_OUTPUT_STREAM_INFO
+	if hr := enc.transform.GetOutputStreamInfo(0, &info); d3d.HRESULT(hr).Failed() {
+		return fmt.Errorf("GetOutputStreamInfo: %w", d3d.HRESULT(hr))
+	}
+	enc.providesSamples = info.DwFlags&mf.MFT_OUTPUT_STREAM_PROVIDES_SAMPLES != 0
+	enc.outputBufSize = info.CbSize
+	if enc.outputBufSize == 0 {
+		enc.outputBufSize = 1024 * 1024
+	}
+	return nil
+}
+
+func (enc *H264MFTEncoder) renegotiateOutput() error {
+	var lastErr error
+	for i := uint32(0); i < 64; i++ {
+		var mt *mf.IMFMediaType
+		if hr := enc.transform.GetOutputAvailableType(0, i, &mt); d3d.HRESULT(hr).Failed() {
+			if lastErr == nil {
+				lastErr = fmt.Errorf("GetOutputAvailableType(%d): %w", i, d3d.HRESULT(hr))
+			}
+			break
+		}
+		if mt == nil {
+			return fmt.Errorf("GetOutputAvailableType(%d) returned no media type", i)
+		}
+		var sub windows.GUID
+		hr := mt.GetGUID(mf.MF_MT_SUBTYPE, &sub)
+		if d3d.HRESULT(hr).Failed() || sub != mf.MFVideoFormat_H264 {
+			mt.Release()
+			continue
+		}
+		// Keep the advertised desktop dimensions. Preserve the encoder's other
+		// attributes (including codec headers) instead of recreating the type.
+		var size uint64
+		if hr := mt.GetUINT64(mf.MF_MT_FRAME_SIZE, &size); !d3d.HRESULT(hr).Failed() &&
+			(size != uint64(enc.width)<<32|uint64(enc.height)) {
+			mt.Release()
+			continue
+		}
+		hr = enc.transform.SetOutputType(0, mt, 0)
+		mt.Release()
+		if d3d.HRESULT(hr).Failed() {
+			lastErr = fmt.Errorf("SetOutputType(%d): %w", i, d3d.HRESULT(hr))
+			continue
+		}
+		if err := enc.refreshOutputStreamInfo(); err != nil {
+			return err
+		}
+		slog.Info("encoder output renegotiated", "width", enc.width, "height", enc.height,
+			"async", enc.isAsync, "provides_samples", enc.providesSamples, "buffer_size", enc.outputBufSize)
+		return nil
+	}
+	if lastErr != nil {
+		return fmt.Errorf("no compatible H264 output type: %w", lastErr)
+	}
+	return fmt.Errorf("no compatible H264 output type for %dx%d", enc.width, enc.height)
+}
+
+// processOutput retries synchronous output immediately. Async output consumes
+// exactly one HaveOutput notification, even when renegotiation is required.
 func (enc *H264MFTEncoder) processOutput() (*EncodedFrame, error) {
+	const maxStreamChanges = 3
+	if enc.isAsync {
+		if enc.pendingHaveOutput == 0 {
+			return nil, fmt.Errorf("async ProcessOutput requires METransformHaveOutput")
+		}
+		enc.pendingHaveOutput--
+		frame, hr, err := enc.processOutputOnce()
+		if uint32(hr) != mf.MF_E_TRANSFORM_STREAM_CHANGE {
+			enc.asyncStreamChanges = 0
+			if err != nil {
+				return nil, fmt.Errorf("async output after event %d (pending input=%d output=%d): %w",
+					enc.lastAsyncEvent, enc.pendingNeedInput, enc.pendingHaveOutput, err)
+			}
+			return frame, err
+		}
+		enc.asyncStreamChanges++
+		if enc.asyncStreamChanges > maxStreamChanges {
+			return nil, fmt.Errorf("ProcessOutput: too many consecutive MF_E_TRANSFORM_STREAM_CHANGE responses (limit %d)", maxStreamChanges)
+		}
+		if err := enc.renegotiateOutput(); err != nil {
+			return nil, fmt.Errorf("renegotiate encoder output after stream change: %w", err)
+		}
+		return nil, nil
+	}
+	for changes := 0; ; changes++ {
+		frame, hr, err := enc.processOutputOnce()
+		if uint32(hr) != mf.MF_E_TRANSFORM_STREAM_CHANGE {
+			return frame, err
+		}
+		if changes == maxStreamChanges {
+			return nil, fmt.Errorf("ProcessOutput: too many consecutive MF_E_TRANSFORM_STREAM_CHANGE responses (limit %d)", maxStreamChanges)
+		}
+		if err := enc.renegotiateOutput(); err != nil {
+			return nil, fmt.Errorf("renegotiate encoder output after stream change: %w", err)
+		}
+	}
+}
+
+func (enc *H264MFTEncoder) processOutputOnce() (*EncodedFrame, int32, error) {
 	outData := mf.MFT_OUTPUT_DATA_BUFFER{}
 	var allocatedSample *mf.IMFSample
 
 	if !enc.providesSamples {
 		// MFT does NOT provide its own samples — we must allocate.
 		if hr := mf.MFCreateSample(&allocatedSample); d3d.HRESULT(hr).Failed() {
-			return nil, fmt.Errorf("MFCreateSample: %w", d3d.HRESULT(hr))
+			return nil, hr, fmt.Errorf("MFCreateSample: %w", d3d.HRESULT(hr))
 		}
 		var outBuf *mf.IMFMediaBuffer
 		if hr := mf.MFCreateMemoryBuffer(enc.outputBufSize, &outBuf); d3d.HRESULT(hr).Failed() {
 			allocatedSample.Release()
-			return nil, fmt.Errorf("MFCreateMemoryBuffer: %w", d3d.HRESULT(hr))
+			return nil, hr, fmt.Errorf("MFCreateMemoryBuffer: %w", d3d.HRESULT(hr))
 		}
-		allocatedSample.AddBuffer(outBuf)
+		hr := allocatedSample.AddBuffer(outBuf)
 		outBuf.Release()
+		if d3d.HRESULT(hr).Failed() {
+			allocatedSample.Release()
+			return nil, hr, fmt.Errorf("AddBuffer: %w", d3d.HRESULT(hr))
+		}
 		outData.PSample = allocatedSample
 	}
 	// else: PSample stays nil; MFT will fill it in.
 
 	var status uint32
 	hr := enc.transform.ProcessOutput(0, 1, &outData, &status)
+	if outData.PEvents != nil {
+		outData.PEvents.Release()
+	}
+	// The caller allocation and any MFT-provided sample each own one reference.
+	if allocatedSample != nil {
+		defer allocatedSample.Release()
+	}
+	if outData.PSample != nil && outData.PSample != allocatedSample {
+		defer outData.PSample.Release()
+	}
 
 	if uint32(hr) == mf.MF_E_TRANSFORM_NEED_MORE_INPUT {
-		if allocatedSample != nil {
-			allocatedSample.Release()
-		}
-		return nil, nil
+		return nil, hr, nil
 	}
 	if d3d.HRESULT(hr).Failed() {
-		if allocatedSample != nil {
-			allocatedSample.Release()
-		}
-		return nil, fmt.Errorf("ProcessOutput: %w", d3d.HRESULT(hr))
+		return nil, hr, fmt.Errorf("ProcessOutput: %w", d3d.HRESULT(hr))
 	}
 
 	result := outData.PSample
 	if result == nil {
-		return nil, nil
+		return nil, hr, nil
 	}
-	defer result.Release()
 
-	return enc.extractFrame(result)
+	frame, err := enc.extractFrame(result)
+	return frame, hr, err
 }
 
 func (enc *H264MFTEncoder) extractFrame(sample *mf.IMFSample) (*EncodedFrame, error) {
@@ -445,19 +607,16 @@ func (enc *H264MFTEncoder) SetBitrate(bps uint32) error {
 
 // Flush drains any buffered output frames from the encoder.
 func (enc *H264MFTEncoder) Flush() ([]*EncodedFrame, error) {
-	enc.transform.ProcessMessage(mf.MFT_MESSAGE_COMMAND_DRAIN, 0)
+	if hr := enc.transform.ProcessMessage(mf.MFT_MESSAGE_COMMAND_DRAIN, 0); d3d.HRESULT(hr).Failed() {
+		return nil, fmt.Errorf("ProcessMessage(COMMAND_DRAIN): %w", d3d.HRESULT(hr))
+	}
 
-	var frames []*EncodedFrame
+	frames := enc.pendingFrames
+	enc.pendingFrames = nil
 	if enc.isAsync {
+		enc.pendingNeedInput = 0
 		for {
-			et, err := enc.getNextEventType()
-			if err != nil {
-				return frames, nil
-			}
-			if et == mf.METransformDrainComplete {
-				break
-			}
-			if et == mf.METransformHaveOutput {
+			if enc.pendingHaveOutput > 0 {
 				f, ferr := enc.processOutput()
 				if ferr != nil {
 					return frames, ferr
@@ -465,6 +624,15 @@ func (enc *H264MFTEncoder) Flush() ([]*EncodedFrame, error) {
 				if f != nil {
 					frames = append(frames, f)
 				}
+				continue
+			}
+			et, err := enc.readAsyncEvent()
+			if err != nil {
+				return frames, err
+			}
+			if et == mf.METransformDrainComplete {
+				enc.pendingNeedInput = 0
+				break
 			}
 		}
 	} else {

@@ -175,7 +175,19 @@ type MFT_OUTPUT_DATA_BUFFER struct {
 	DwStreamID uint32
 	PSample    *IMFSample
 	DwStatus   uint32
-	PEvents    uintptr // IMFCollection*, unused
+	PEvents    *IMFCollection
+}
+
+// IMFCollection only needs IUnknown::Release here: ProcessOutput transfers
+// ownership of its optional event collection to the caller, including on errors.
+type IMFCollection struct {
+	_    structs.HostLayout
+	vtbl *com.IUnknownVtbl
+}
+
+func (obj *IMFCollection) Release() int32 {
+	ret, _, _ := syscall.SyscallN(obj.vtbl.Release, uintptr(unsafe.Pointer(obj)))
+	return int32(ret)
 }
 
 // HRESULT codes for MFT operations.
