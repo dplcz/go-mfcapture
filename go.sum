@@ -1,6 +1,8 @@
 github.com/kirides/go-d3d v1.0.1 h1:ZDANfvo34vskBMET1uwUUMNw8545Kbe8qYSiRwlNIuA=
 github.com/kirides/go-d3d v1.0.1/go.mod h1:99AjD+5mRTFEnkpRWkwq8UYMQDljGIIvLn2NyRdVImY=
-golang.org/x/sys v0.33.0 h1:q3i8TbbEz+JRD9ywIRlyRAQbM0qF7hu24q3teo2hbuw=
-golang.org/x/sys v0.33.0/go.mod h1:BJP2sWEmIv4KK5OTEluFJCKSidICx8ciO85XgH3Ak8k=
+github.com/tphakala/go-opus v1.2.1 h1:j3DlcDf+9VTUzOEZ6kODoZoLMb/MTN2+ft24VuO8FaQ=
+github.com/tphakala/go-opus v1.2.1/go.mod h1:CzYWGAXjMJHIqu/aTowxgmut2D0+OFJCjQ9+YJHDJV0=
+github.com/tphakala/simd v1.11.0 h1:3rtUU/6mO76R4rq3hQiEX+DC4yKc/twIGU62bkmIAYA=
+github.com/tphakala/simd v1.11.0/go.mod h1:eO53GkWg40mRbr2tzs0Xb1IMZQ5U8cMR+Aa1RlXUinE=
 golang.org/x/sys v0.48.0 h1:bbX/i/6MgT9BVLM9RT1thmxL04yeTAhbEz4SyadbXoo=
 golang.org/x/sys v0.48.0/go.mod h1:hNLxWAXmnKAxqDtdwIYC4bM9oQPEecfsnNMuSxOs3og=

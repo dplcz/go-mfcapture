@@ -3,3 +3,6 @@
 docs
 *.h264
 *.nv12
+bench/opusbench/testdata/
+bench/opusbench/*-results.txt
+bench/
