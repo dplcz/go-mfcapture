@@ -164,9 +164,10 @@ audio/
   decoder.go           Decoder 接口 + DecodedFrame
   opus_encoder.go      OpusEncoderConfig + OpusEncoder（go-opus 适配）
   opus_decoder.go      OpusDecoderConfig + OpusDecoder（PLC + FEC + PreSkip）
-  format.go            Format / Frame                     ← P2
-  ring.go              PCM ring buffer                    ← P2
-  capturer.go          Capturer 接口                       ← P2
+  format.go            Format / Frame / PCM→float32 转换      ← P2
+  capturer.go          Capturer 接口 + ErrTimeout             ← P2
+  ring.go              Ring：固定容量 PCM 字节 FIFO            ← P2
+  framer.go            Framer：20 ms 分帧 / 静音 / 积压丢弃     ← P2
   wasapi.go            WASAPI loopback 实现（纯 Go COM 绑定）  ← P3
   wasapi_types.go      WAVEFORMATEX(EXTENSIBLE)、GUID、vtable ← P3
   resample.go          非 48 kHz 时的兜底重采样（可后置）
@@ -199,26 +200,78 @@ cmd/mfaudio/           CLI：录 loopback 到 Ogg Opus / 原始包，人工验�
 ```go
 // audio/format.go
 type Format struct {
-    SampleRate int // 48000
-    Channels   int // 1 或 2
-    Float32    bool
+    SampleRate int  // 48000
+    Channels   int  // 1 或 2
+    Float32    bool // true: F32LE；false: S16LE
 }
+func (f Format) Validate() error
+func (f Format) BytesPerSample() int
+func (f Format) BlockAlign() int                       // 一个采样帧的字节数
+func (f Format) Samples(data []byte) int               // data 包含的采样帧数
+func (f Format) FrameBytes(sampleFrames int) int
+func (f Format) ToFloat32(dst []float32, data []byte) (int, error)
 
 type Frame struct {
-    // Data 是交错 PCM：Float32=true 时 F32LE，否则 S16LE。
     Data      []byte
-    Timestamp time.Duration // 相对 Session epoch
+    Timestamp time.Duration // Capturer 已换算成相对 epoch 的 PTS
     Duration  time.Duration
-    Silent    bool
+    Silent    bool          // 采集源补的静音；Data 仍是正确长度的全零 PCM
 }
+
+// audio/capturer.go
+var ErrTimeout = errors.New("audio: capture timed out")
 
 type Capturer interface {
     Format() Format
-    // ReadFrame 最多等待 timeout；超时返回 ErrTimeout。
+    // ReadFrame 最多等待 timeout；无数据时返回 (nil, ErrTimeout)。
+    // 返回的 Frame.Data 只在下一次 ReadFrame 之前有效。
     ReadFrame(timeout time.Duration) (*Frame, error)
     Release()
 }
 ```
+
+**P2 决策**：`Frame` 保留设计里的 `[]byte`（F32LE/S16LE 由 `Format.Float32`
+区分），采集层可以零拷贝交出 WASAPI 缓冲；编码前用 `Format.ToFloat32`
+一次性转成 `[]float32`。时间戳由 Capturer 负责换算成 epoch 相对 PTS——
+WASAPI 实现内部把首个包的 `qpcPosition` 锚定到 epoch，上层不接触 QPC。
+
+### 6.1 Ring 与 Framer（P2）
+
+```go
+// audio/ring.go —— 只做字节 FIFO，不解释时间戳
+func NewRing(format Format, maxLatency time.Duration) (*Ring, error)
+func (r *Ring) Append(data []byte) (droppedSamples int, err error)
+func (r *Ring) Available() int                       // 采样帧数
+func (r *Ring) Take(sampleFrames int) ([]byte, error) // 别名内部缓冲
+func (r *Ring) Drop(sampleFrames int) int
+func (r *Ring) Cap() int
+func (r *Ring) DroppedSamples() int
+func (r *Ring) Reset()
+
+// audio/framer.go —— 分帧、PTS、静音补齐、积压丢弃
+type FramerConfig struct {
+    Format     Format
+    MaxLatency time.Duration // 0 = 200 ms
+}
+func NewFramer(cfg FramerConfig) (*Framer, error)
+func (f *Framer) Append(fr *Frame) error
+func (f *Framer) Take() (*Frame, bool)       // 攒满 960 采样才产出
+func (f *Framer) Silence() *Frame            // 补一帧 20 ms 静音并推进 PTS
+func (f *Framer) Available() int
+func (f *Framer) NextPTS() time.Duration
+func (f *Framer) DroppedFrames() int
+func (f *Framer) Reset()
+```
+
+职责边界：`Ring` 只管字节和容量，溢出时丢最旧的整 20 ms 帧；`Framer`
+在其上维护 PTS 时间线并产出固定 20 ms 帧。调用方（P4 的 AudioPipeline）
+决定何时阻塞读采集源、何时调 `Silence`，因此 P2 的三项验收标准可以脱离
+WASAPI 用假 `Capturer` 完整验证。
+
+时间线规则：第一条非空数据锚定 PTS，之后按采样数推进；ring 排空后允许
+向前重新对齐到源时钟，但不倒退（补过静音后源时间戳略早时保持单调）。
+`Framer` 不要求 48 kHz 以外的格式：非 48 kHz 端点需要先重采样，构造时
+直接报错而不是静默产出错误时长的帧。
 
 ```go
 // audio/opus_encoder.go
@@ -374,17 +427,20 @@ for {
         n, _ := capture.GetNextPacketSize()
         if n == 0 { break }
         data, frames, flags, _, qpc := capture.GetBuffer()
-        // flags&AUDCLNT_BUFFERFLAGS_SILENT != 0 时 data 不可读，按 0 填充
-        ring.Append(data, frames, flags, qpc)
+        // flags&AUDCLNT_BUFFERFLAGS_SILENT != 0 时 data 不可读，按 0 填充；
+        // PTS 由 qpc 锚定到 epoch（见 §7.3），换算后再交给 Framer。
+        pts := epochAnchor + (qpc - firstQPC)
+        frame := &Frame{Data: pcm, Timestamp: pts, Duration: durationOf(frames)}
+        framer.Append(frame)
         capture.ReleaseBuffer(frames)
     }
-    for ring.Available() >= frameSamples {
-        pcm, ts := ring.Take(frameSamples) // ts 来自 qpc → epoch
-        emit(pcm, ts)
+    for {
+        pcm, ok := framer.Take() // 只在攒满 960 采样时产出
+        if !ok { break }
+        emit(pcm)
     }
-    if wait == timeout && ring.Available() == 0 && silenceMode {
-        emit(zeros, nextPTS) // 保持 50 pps
-        nextPTS += 20 * time.Millisecond
+    if wait == timeout && framer.Available() == 0 && silenceMode {
+        emit(framer.Silence()) // 保持 50 pps，PTS 继续按 20 ms 推进
     }
 }
 ```
@@ -502,7 +558,8 @@ go audio.Run(ctx)
    - PreSkip 采样被静默丢弃，不出现在回调中；
    - 编码→解码往返 SNR 与 `bench/opusbench` 一致。
 4. **分帧/节拍单测**：用假 `Capturer` 注入 0/10/30/200 ms 的包，验证
-   50 pps 输出、静音补齐、积压丢帧。
+   50 pps 输出、静音补齐、积压丢帧；另测 Ring 的环绕搬移、非对齐输入、
+   单个超容量包与 `Format.ToFloat32` 的两种采样编码。
 5. **WASAPI 冒烟**：`cmd/mfaudio -duration 5s -o out.opus`，播放已知
    440 Hz 音源，检查包率 50 pps、实测码率、VLC 可播放。用 build tag
    `//go:build windows && integration` 隔离，避免无音频端点的 CI 失败。
@@ -542,7 +599,7 @@ go audio.Run(ctx)
 - `OpusEncoderConfig.Complexity` 零值取 **5**，不是 go-opus 的库默认 10——10 的 CPU
   占用翻倍而音质差异听不出来。
 - `AudioDesc.PreSkip` 不写死 312，直接取 `OpusEncoder.PreSkip()`；解码侧的
-  兜底常量 `opusDefaultPreSkip` 由 `TestOpusPreSkipMatchesLibrary` 断言与库
+  兜底常量 `defaultPreSkip` 由 `TestOpusPreSkipMatchesLibrary` 断言与库
   一致，换实现时该测试先失败。
 - go-opus 的解码器**不**丢 pre-skip（那是容器的活），本项目没有容器，所以
   裁剪放在 `OpusDecoder` 里，由 `OpusDecoderConfig.PreSkip` 驱动。首帧因此
@@ -550,18 +607,44 @@ go audio.Run(ctx)
 - `EncodedFrame.Data` / `DecodedFrame.PCM` 指向内部缓冲，只在下
   一次 Encode/Decode 之前有效；P4 的 `AudioPipeline` 负责复制后交给 Sink。
 
-验收标准：`go test ./encode/...` 全绿，benchmark 数据与 `bench/opusbench` 吻合。
+验收标准：`go test ./audio/...` 全绿，benchmark 数据与 `bench/opusbench` 吻合。
 
-#### P2：音频格式与分帧逻辑（依赖 P1）
+#### P2：音频格式与分帧逻辑 ✅ 已完成
 
 | 文件 | 内容 |
 |------|------|
-| `audio/format.go` | `Format`、`Frame`、`Capturer` 接口定义 |
-| `audio/ring.go` | PCM ring buffer：`Append`/`Take`/`Available`/`Drop`，按 960 采样对齐 |
-| `audio/fake_capturer_test.go` | 假 `Capturer`：可编程注入任意时长/间隔的 PCM 帧 |
-| `audio/ring_test.go` | 分帧/节拍单测（测试清单第 4 条） |
+| `audio/format.go` | `Format`（F32LE/S16LE）、`Frame`、`Format.ToFloat32` 转换 |
+| `audio/capturer.go` | `Capturer` 接口 + `ErrTimeout` |
+| `audio/ring.go` | `Ring`：固定容量 PCM 字节 FIFO，`Append`/`Take`/`Available`/`Drop`，按 960 采样对齐丢整帧 |
+| `audio/framer.go` | `Framer`：20 ms 分帧、PTS 时间线、静音补齐、积压统计 |
+| `audio/fake_capturer_test.go` | 假 `Capturer`：虚拟时钟回放任意时长/间隔的 PCM 包 |
+| `audio/format_test.go` | 格式校验、布局换算、两种采样编码的 float32 转换 |
+| `audio/ring_test.go` | 环绕搬移、非对齐输入、溢出丢最旧整帧、超大包只留最新 |
+| `audio/framer_test.go` | 10/30 ms 包节奏、静音补齐、积压丢弃、PTS 单调（测试清单第 4 条） |
 
-验收标准：ring buffer 在各种输入节奏下正确分帧，50 pps 输出，静音补齐，积压丢弃。
+**P2 决策**（开工前确认）：
+
+- `Frame` 保留设计里的 `[]byte` + `Format.Float32`，采集层可零拷贝交出 WASAPI
+  缓冲；编码前由 `Format.ToFloat32` 统一转成 `[]float32`。
+- 节拍逻辑拆成 `Ring`（纯字节 FIFO）+ `Framer`（分帧/PTS/静音），而不是全部
+  塞进 ring：两者都能脱离 WASAPI 独立测试，P4 的 `AudioPipeline` 只做编排。
+- `Frame.Timestamp` 由 Capturer 换算成相对 epoch 的 PTS（WASAPI 内部锚定
+  `qpcPosition`），上层不接触 QPC。
+
+**实现细节**：
+
+- `Ring` 的容量按 `maxLatency` 换算成整 20 ms 帧，溢出时只丢整帧；单个包比
+  整个环还大时只保留最新的一段。`Take` 返回内部缓冲别名，`Framer` 复制后再
+  交给调用方，避免暴露环形布局。
+- `Framer` 的时间线由第一条非空数据锚定，之后按采样数推进；ring 排空后允许
+  向前重对齐到源时钟，但不倒退——补过静音后源时间戳略早时，单调性对接收端
+  的抖动缓冲更重要。
+- `Framer` 构造时拒绝非 48 kHz 格式：重采样尚未实现，静默按 44.1 kHz 采样数
+  产帧会让每帧时长变成 21.8 ms。
+
+验收结果：`go test ./audio/` 全绿（含 P1）；10 ms/30 ms 包节奏均长期 50 pps，
+100 ms 积压上限下 400 ms 巨型包保留最新 5 帧并统计丢弃 15 帧，静音补齐后
+PTS 连续且不倒退。
 
 #### P3：WASAPI loopback COM 绑定（可与 P1/P2 并行）
 
