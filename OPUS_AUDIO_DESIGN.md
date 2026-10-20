@@ -407,43 +407,57 @@ GUID：
 3. 构造目标格式 `WAVEFORMATEXTENSIBLE`：48 kHz、2ch、32-bit float、
    `WAVE_FORMAT_EXTENSIBLE`、`SPEAKER_FRONT_LEFT|RIGHT`。
 4. `Initialize(SHARED, LOOPBACK | EVENTCALLBACK | AUTOCONVERTPCM |
-   SRC_DEFAULT_QUALITY, 100ms, 0, targetFormat, nil)`。
+   SRC_DEFAULT_QUALITY, 0, 0, targetFormat, nil)`。
+   - **shared 模式的事件驱动要求 `hnsBufferDuration` 和 `hnsPeriodicity`
+     都为 0**，缓冲区大小由音频引擎的调度周期决定（通常 10 ms），不能像
+     独占模式那样自己指定 100 ms。
    - `AUTOCONVERTPCM` 让 Windows 把端点混音格式重采样/下混到 48 kHz
      立体声；端点本来是 44.1 kHz 或 5.1 时不需要自己处理。
-   - 若 `Initialize` 拒绝目标格式（老系统/驱动），退回 `GetMixFormat`，
-     用 `resample.go` 做兜底转换，并上报 degraded 事件。
-5. `CreateEvent` + `SetEventHandle`，`Start`。
+   - 若 `Initialize` 拒绝目标格式，必须重新 `Activate` 一个 `IAudioClient`
+     （失败过的实例可能永久返回 `E_ALREADY_INITIALIZED`），再用
+     `GetMixFormat` 回退。回退只接受 48 kHz 且 1/2 声道的 16-bit PCM 或
+     32-bit float；其他情况返回明确错误——本层还没有重采样。
+5. `CreateEvent`（自动重置）+ `SetEventHandle`，`Start`。
 6. 退出时 `Stop`、释放所有接口、`CoTaskMemFree(mixFormat)`、关闭事件。
 
-缓冲区给 100~200 ms。WASAPI 引擎大约每 10 ms 唤醒一次，采集包大小通常
-是 10 ms 的整数倍；**不要拿到一个包就编一包**，要先累积到 960 采样。
+WASAPI 引擎大约每 10 ms 唤醒一次，采集包大小是引擎周期的整数倍（常见
+10 ms，也可能是 30 ms）；**不要拿到一个包就编一包**，交给 `Framer`
+累积到 960 采样再产出。
 
 ### 7.2 读取循环
 
+事件等待、`GetNextPacketSize` 与 `GetBuffer/ReleaseBuffer` 都收在
+`WASAPICapturer.ReadFrame` 内部；`AudioPipeline` 只看到"一个包或超时"：
+
 ```go
 for {
-    wait := WaitForSingleObject(event, 20 /*ms*/)
-    for {
-        n, _ := capture.GetNextPacketSize()
-        if n == 0 { break }
-        data, frames, flags, _, qpc := capture.GetBuffer()
-        // flags&AUDCLNT_BUFFERFLAGS_SILENT != 0 时 data 不可读，按 0 填充；
-        // PTS 由 qpc 锚定到 epoch（见 §7.3），换算后再交给 Framer。
-        pts := epochAnchor + (qpc - firstQPC)
-        frame := &Frame{Data: pcm, Timestamp: pts, Duration: durationOf(frames)}
-        framer.Append(frame)
-        capture.ReleaseBuffer(frames)
+    frame, err := capturer.ReadFrame(20 * time.Millisecond)
+    switch {
+    case err == nil:
+        framer.Append(frame) // ReadFrame 返回的 Data 在下一帧后失效
+    case errors.Is(err, ErrTimeout):
+        // loopback 静音时的正常状态
+    case errors.Is(err, ErrDeviceLost):
+        // 销毁并重建 Capturer，期间继续补静音（见下）
+    default:
+        return err
     }
+
     for {
         pcm, ok := framer.Take() // 只在攒满 960 采样时产出
         if !ok { break }
         emit(pcm)
     }
-    if wait == timeout && framer.Available() == 0 && silenceMode {
+    if timedOut && framer.Available() == 0 && silenceMode {
         emit(framer.Silence()) // 保持 50 pps，PTS 继续按 20 ms 推进
     }
 }
 ```
+
+`ReadFrame` 内部：先 `ReleaseBuffer` 上一个包，再在自动重置事件上等待；
+`SILENT` 标志置位时 WASAPI 的 data 指针不可读，Capturer 返回全零 PCM 并把
+`Frame.Silent` 置 true。两个连续的 `ReadFrame` 调用之间包不会被释放，因此
+调用方必须在下一次读取前消费完 `Frame.Data`（`Framer.Append` 会复制）。
 
 需要明确的策略：
 
@@ -454,8 +468,10 @@ for {
   `Stats.Dropped` 自增。只丢**整 20 ms 帧**，不要切在半帧上。
 - **DTX**：开启后 go-opus 对连续数字静音编码 1 字节包。补静音与 DTX
   可以同时用：包率不变，静音期码率接近 0。
-- **设备变化**：默认端点被拔掉/切换时，采集会报错。捕获后销毁并重建
-  `IAudioClient`，期间持续补静音；不要像视频那样直接把整条管线返回。
+- **设备变化**：默认端点被拔掉/切换时，`ReadFrame` 返回包裹
+  `ErrDeviceLost` 的错误。采集层不自己重连；P4 的 `AudioPipeline` 负责
+  销毁重建，重建期间继续用 `Framer.Silence` 推进时间线，不要像视频那样
+  直接把整条管线返回。
 
 ### 7.3 时间戳与 A/V 同步
 
@@ -464,17 +480,20 @@ for {
 
 1. 给 `PipelineConfig` 增加 `Epoch time.Time`（零值 = `time.Now()`），
    `pipeline.go` 里 `start` 改用它。这是向后兼容的小改动。
-2. `AudioPipeline` 用同一个 `Epoch`。WASAPI 的 `GetBuffer` 会返回
-   `qpcPosition`（首采样的 QPC 时间，100 ns）。把首个包的 qpc 与 epoch
-   锚定后，后续帧：
+2. `WASAPICapturerConfig.Epoch` 必须用同一个 Epoch。WASAPI 的
+   `GetBuffer` 返回的 `qpcPosition` 已经是 **100 ns 单位**（不是原始
+   `QueryPerformanceCounter` 计数，Windows 已替我们换算）。首包还要扣掉
+   "从被采集到被读到"的延迟：
 
    ```
-   pts = firstPTS + (qpc - firstQPC) + (samplesSinceFirst / 48000)
+   firstPTS = time.Since(epoch) - (qpcNow100ns - qpcPosition)
+   pts      = firstPTS + (qpc - qpcPosition)
    ```
 
-   优先信 QPC（它和视频时钟同源），用累计采样数补插值；每 10 s 比较一次
-   两者，偏差 > 20 ms 时以 QPC 为准修正。
-3. 若补了静音帧，PTS 按 `上一帧 PTS + 20 ms` 推进。
+   否则音频会整体晚一个引擎周期，直接影响唇音同步。qpc 倒退或包上带
+   `TIMESTAMP_ERROR` 时按包时长推进，并保证 PTS 不早于上一包结束
+   （单调、不重叠）。
+3. 若补了静音帧，`Framer.Silence` 按 `上一帧 PTS + 20 ms` 推进。
 4. **PreSkip**：go-opus 在 48 kHz 下是 312 采样（6.5 ms），pion 实测是
    120 采样（2.5 ms，它没有实现 192 采样的 delay-compensation ring）。
    raw packet 传输时 `AudioDesc.PreSkip` 必须由编码器实现给出，**不能写死
@@ -646,17 +665,42 @@ go audio.Run(ctx)
 100 ms 积压上限下 400 ms 巨型包保留最新 5 帧并统计丢弃 15 帧，静音补齐后
 PTS 连续且不倒退。
 
-#### P3：WASAPI loopback COM 绑定（可与 P1/P2 并行）
+#### P3：WASAPI loopback COM 绑定 ✅ 已完成
 
 | 文件 | 内容 |
 |------|------|
-| `audio/wasapi_types.go` | `WAVEFORMATEX(EXTENSIBLE)`、COM GUID、vtable 结构体 |
-| `audio/wasapi.go` | `WASAPICapturer`：实现 `audio.Capturer` 接口，事件驱动读取循环 |
+| `audio/wasapi_types.go` | `WAVEFORMATEX(EXTENSIBLE)`、GUID、4 个 COM vtable、`CoCreateInstance`/`CoTaskMemFree`/QPC 绑定 |
+| `audio/wasapi.go` | `WASAPICapturer`：设备选择、格式协商、事件驱动 `ReadFrame`、QPC→PTS、SILENT 补零、设备丢失映射 |
+| `audio/wasapi_test.go` | ABI 布局、WAVEFORMATEX 解析、目标格式、QPC 时钟单调性/回退 |
+| `audio/wasapi_integration_test.go` | `windows && integration` 冒烟：打开默认端点并读 500 ms |
 
-这是工作量最大的一块（约 400~600 行 COM 绑定），风格与 `mf/` 包一致：
-手写 vtable + `syscall.SyscallN`，不引入 CGo。
+**P3 决策**（开工前确认）：
 
-验收标准：`//go:build windows && integration` 下可采集到系统音频。
+- **COM 归属**：`AudioPipeline.Run` 在锁定线程上 `CoInitializeEx`/`CoUninitialize`；
+  `WASAPICapturer` 只要求调用方已初始化 MTA，自身不碰 apartment，与
+  `pipeline.go` / `decode.Session` 一致。
+- **格式兜底**：先请求 48 kHz / F32 / 1~2ch + `AUTOCONVERTPCM`；失败时重新
+  `Activate` 并回退 `GetMixFormat`，只接受 48 kHz 且 1/2 声道的 16-bit PCM
+  或 32-bit float。重采样留在以后。
+- **设备丢失**：`ReadFrame` 把 `AUDCLNT_E_DEVICE_INVALIDATED` /
+  `RESOURCES_INVALIDATED` / `SERVICE_NOT_RUNNING` / `ENDPOINT_CREATE_FAILED`
+  映射成包裹 `ErrDeviceLost` 的错误；重连策略（销毁重建 + 补静音）放在 P4。
+
+**实现中修正的设计假设**：
+
+- shared 模式事件驱动时 `Initialize` 的 `hnsBufferDuration` 和
+  `hnsPeriodicity` 必须都是 0（MSDN），设计里写的 100 ms 缓冲区只适用于
+  独占模式。实际缓冲由引擎周期决定，下游 ring 的 200 ms 上限才是抖动缓冲。
+- `qpcPosition` 是 100 ns 单位，不是原始 QPC 计数；首包还要减去
+  "采集→读取"的延迟，否则 PTS 整体偏晚一个引擎周期。
+- `WAVEFORMATEX` 不能直接嵌入 Go 结构体做扩展格式：Go 的对齐填充会把
+  `Samples` 推到偏移 20，而 Windows 要求 18。`waveFormatExtensible` 用
+  平铺字段，单测断言 sizeof=40 与各字段偏移。
+
+**实测**（Windows 11，默认渲染端点，播放系统提示音）：500 ms 内收到
+49 个包 / 23520 采样帧（约 490 ms 音频），格式协商为 48 kHz / 2ch / F32，
+PTS 单调，末帧 PTS 501 ms。系统静音时不产包，`ReadFrame` 按契约返回
+`ErrTimeout`。
 
 #### P4：AudioPipeline + CLI（依赖 P1 + P2 + P3）
 

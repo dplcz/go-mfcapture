@@ -9,6 +9,10 @@ import (
 // 不会产生任何包，这是正常状态，调用方应据此补静音而不是当作故障。
 var ErrTimeout = errors.New("audio: capture timed out")
 
+// ErrDeviceLost 表示默认音频端点被拔出、切换或被禁用，采集流已经失效。
+// 调用方应销毁 Capturer 并重建；重建期间可以继续用 Framer 补静音。
+var ErrDeviceLost = errors.New("audio: capture device lost")
+
 // Capturer 抽象一个音频采集源，与视频侧的 capture.Capturer 对称。
 type Capturer interface {
 	// Format 返回采集源固定的 PCM 格式。音频链路要求 48000 Hz；非 48 kHz
