@@ -13,8 +13,11 @@ const (
 	OpusSampleRate = 48000
 	// OpusFrameMs 是每包的帧长。20 ms 是 Opus 的标准帧长，也是 RTP 的 ptime=20。
 	OpusFrameMs = 20
-	// frameSamples 是每声道每帧的采样数：48000 * 20 / 1000 = 960。
-	frameSamples = OpusSampleRate * OpusFrameMs / 1000
+	// OpusFrameSamples 是每声道每帧的采样数：48000 * 20 / 1000 = 960，
+	// 也就是 Opus 的 20 ms 帧长。上层按它分配 float32 编码缓冲。
+	OpusFrameSamples = OpusSampleRate * OpusFrameMs / 1000
+	// frameSamples 是包内使用的短名，与 OpusFrameSamples 保持同一个值。
+	frameSamples = OpusFrameSamples
 
 	// maxPacketSize 是单帧包的最大字节数。go-opus 文档：1276 字节可容纳任意
 	// 2.5~20 ms 的 VBR 包；缓冲不足时 libopus 会主动降码率而不是报错，所以这里
