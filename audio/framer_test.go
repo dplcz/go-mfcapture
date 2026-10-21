@@ -284,3 +284,34 @@ func TestFramerReleaseCapturer(t *testing.T) {
 		t.Error("ReadFrame after Release succeeded, want error")
 	}
 }
+
+func TestFramerAnchor(t *testing.T) {
+	fr := mustFramer(t, 0)
+	if fr.Started() {
+		t.Error("Started()=true on a fresh Framer")
+	}
+	fr.Anchor(3 * time.Second)
+	if !fr.Started() {
+		t.Fatal("Started()=false after Anchor")
+	}
+	if got := fr.NextPTS(); got != 3*time.Second {
+		t.Errorf("NextPTS()=%v after Anchor, want 3s", got)
+	}
+
+	// 已锚定后 Anchor 不生效。
+	fr.Anchor(10 * time.Second)
+	if got := fr.NextPTS(); got != 3*time.Second {
+		t.Errorf("NextPTS()=%v after second Anchor, want 3s", got)
+	}
+
+	// Silence 从锚点开始推进，数据到来时保持单调。
+	if s := fr.Silence(); s.Timestamp != 3*time.Second || !s.Silent {
+		t.Errorf("Silence() = %+v, want PTS 3s and Silent", s)
+	}
+	if err := fr.Append(&Frame{Data: rampS16(960, 2, 0), Timestamp: 2 * time.Second}); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	if f, ok := fr.Take(); !ok || f.Timestamp != 3020*time.Millisecond {
+		t.Errorf("frame after Anchor = (%v, %v), want PTS 3.02s", f, ok)
+	}
+}

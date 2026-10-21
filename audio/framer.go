@@ -143,6 +143,21 @@ func (f *Framer) Available() int { return f.ring.Available() }
 // NextPTS 返回下一帧将要使用的 PTS。
 func (f *Framer) NextPTS() time.Duration { return f.nextPTS }
 
+// Started 报告时间线是否已经锚定（发生过 Append、Silence 或 Anchor）。
+func (f *Framer) Started() bool { return f.started }
+
+// Anchor 在时间线尚未锚定时把起点设为 pts。已经锚定后调用无效。
+//
+// AudioPipeline 用它在采集源一直没有数据时从当前时刻开始补静音；设备重建后
+// 也会新建一个 Framer 并锚定到旧时间线的下一帧，保证 A/V 同步不跳变。
+func (f *Framer) Anchor(pts time.Duration) {
+	if f.started {
+		return
+	}
+	f.started = true
+	f.nextPTS = pts
+}
+
 // DroppedSamples 返回因积压累计丢弃的采样帧数（每声道）。
 func (f *Framer) DroppedSamples() int { return f.dropped }
 
