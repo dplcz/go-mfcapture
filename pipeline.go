@@ -113,6 +113,9 @@ type PipelineConfig struct {
 	GOPSize    uint32 // 关键帧间隔（帧数）；0 = 编码器默认，首帧可能来得较晚
 	LowLatency bool   // 低延迟模式；零值为 false
 	CursorFPS  uint32 // 光标轮询频率；0 = 30
+	// Epoch 是视频 PTS 的零点；零值 = Run 开始的时刻。音频管线必须传同一个
+	// 值（AudioPipelineConfig.Epoch），两路时间戳才能直接比较做 A/V 同步。
+	Epoch time.Time
 }
 
 // Pipeline 是一条"屏幕 → H264 字节 + 光标"的管线。
@@ -318,7 +321,12 @@ func (p *Pipeline) Run(ctx context.Context) error {
 
 	limiter := newFrameLimiter(p.cfg.MaxFPS)
 
-	start := time.Now()
+	// 与音频管线共享同一零点：显式 Epoch 时首帧 PTS 包含建管线的时间，
+	// 两路时间戳可直接比较；零值保持"Run 内循环开始时计时"的旧行为。
+	start := p.cfg.Epoch
+	if start.IsZero() {
+		start = time.Now()
+	}
 	lastHns := int64(-1)
 
 	for {
