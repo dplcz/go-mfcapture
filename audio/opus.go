@@ -29,9 +29,11 @@ const (
 	// 音质差异听不出来，但 CPU 占用差一倍。
 	defaultComplexity = 5
 
-	// defaultPreSkip 是 go-opus 在 48 kHz 下的 pre-skip 采样数（6.5 ms），用作
+	// DefaultPreSkip 是 go-opus 在 48 kHz 下的 pre-skip 采样数（6.5 ms），用作
 	// 没有带外描述时的兜底。真实值应该用对端 AudioDesc 里的 PreSkip 覆盖：
 	// opus_encoder_test.go 断言它与 OpusEncoder.PreSkip() 一致，换实现时这条
 	// 测试会先失败。
-	defaultPreSkip = 312
+	DefaultPreSkip = 312
+	// defaultPreSkip 是包内使用的短名，与 DefaultPreSkip 保持同一个值。
+	defaultPreSkip = DefaultPreSkip
 )

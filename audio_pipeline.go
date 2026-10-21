@@ -41,6 +41,9 @@ const (
 	AudioCaptureError
 	// AudioSilenceDegraded 连续补静音超过 audioSilenceDegradedAfter 时触发一次。
 	AudioSilenceDegraded
+	// AudioDecodeError 是 AudioDecodeSession 解码单个 Opus 包失败时上报的事件。
+	// 该帧会被跳过，会话继续运行。Err 为具体错误。
+	AudioDecodeError
 )
 
 // AudioEvent 是音频管线向上层主动上报的状态变化。
