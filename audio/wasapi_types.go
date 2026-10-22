@@ -85,6 +85,10 @@ var (
 		Data1: 0xC8ADBD64, Data2: 0xE71E, Data3: 0x48A0,
 		Data4: [8]byte{0xA4, 0xDE, 0x18, 0x5C, 0x39, 0x5C, 0xD3, 0x17},
 	}
+	iidAudioRenderClient = windows.GUID{
+		Data1: 0xF294ACFC, Data2: 0x3146, Data3: 0x4483,
+		Data4: [8]byte{0xA7, 0xBF, 0xAD, 0xDC, 0xA7, 0xC2, 0x60, 0xE2},
+	}
 
 	// KSDATAFORMAT_SUBTYPE_*：WAVEFORMATEXTENSIBLE.SubFormat 的取值。
 	ksDataFormatSubtypeIEEEFloat = windows.GUID{
@@ -242,6 +246,14 @@ func (o *iAudioClient) GetBufferSize() (uint32, int32) {
 	return frames, int32(ret)
 }
 
+// GetCurrentPadding 返回渲染缓冲里尚未被设备消费的帧数。
+func (o *iAudioClient) GetCurrentPadding() (uint32, int32) {
+	var frames uint32
+	ret, _, _ := syscall.SyscallN(o.vtbl.GetCurrentPadding,
+		uintptr(unsafe.Pointer(o)), uintptr(unsafe.Pointer(&frames)))
+	return frames, int32(ret)
+}
+
 func (o *iAudioClient) GetMixFormat() (unsafe.Pointer, int32) {
 	var format unsafe.Pointer
 	ret, _, _ := syscall.SyscallN(o.vtbl.GetMixFormat,
@@ -262,6 +274,12 @@ func (o *iAudioClient) Start() int32 {
 
 func (o *iAudioClient) Stop() int32 {
 	ret, _, _ := syscall.SyscallN(o.vtbl.Stop, uintptr(unsafe.Pointer(o)))
+	return int32(ret)
+}
+
+// Reset 清空渲染缓冲里的未播数据。只能在 Stop 之后调用。
+func (o *iAudioClient) Reset() int32 {
+	ret, _, _ := syscall.SyscallN(o.vtbl.Reset, uintptr(unsafe.Pointer(o)))
 	return int32(ret)
 }
 
@@ -322,6 +340,43 @@ func (o *iAudioCaptureClient) GetNextPacketSize() (uint32, int32) {
 	ret, _, _ := syscall.SyscallN(o.vtbl.GetNextPacketSize,
 		uintptr(unsafe.Pointer(o)), uintptr(unsafe.Pointer(&frames)))
 	return frames, int32(ret)
+}
+
+// IAudioRenderClient: IUnknown(0~2) + 2 methods.
+type iAudioRenderClientVtbl struct {
+	_ structs.HostLayout
+	com.IUnknownVtbl
+
+	GetBuffer     uintptr // 3
+	ReleaseBuffer uintptr // 4
+}
+
+type iAudioRenderClient struct {
+	_    structs.HostLayout
+	vtbl *iAudioRenderClientVtbl
+}
+
+func (o *iAudioRenderClient) Release() int32 {
+	ret, _, _ := syscall.SyscallN(o.vtbl.Release, uintptr(unsafe.Pointer(o)))
+	return int32(ret)
+}
+
+// GetBuffer 锁定 numFrames 帧的空闲渲染缓冲，返回的指针在 ReleaseBuffer
+// 之前有效。
+func (o *iAudioRenderClient) GetBuffer(numFrames uint32) (unsafe.Pointer, int32) {
+	var data unsafe.Pointer
+	ret, _, _ := syscall.SyscallN(o.vtbl.GetBuffer,
+		uintptr(unsafe.Pointer(o)),
+		uintptr(numFrames),
+		uintptr(unsafe.Pointer(&data)),
+	)
+	return data, int32(ret)
+}
+
+func (o *iAudioRenderClient) ReleaseBuffer(numFrames uint32, flags uint32) int32 {
+	ret, _, _ := syscall.SyscallN(o.vtbl.ReleaseBuffer,
+		uintptr(unsafe.Pointer(o)), uintptr(numFrames), uintptr(flags))
+	return int32(ret)
 }
 
 func coCreateEnumerator() (*iMMDeviceEnumerator, int32) {
