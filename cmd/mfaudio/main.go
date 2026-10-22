@@ -11,6 +11,7 @@ import (
 
 	"mfcapture"
 	"mfcapture/audio"
+	"mfcapture/internal/oggopus"
 )
 
 func main() {
@@ -95,7 +96,7 @@ func averageKbps(bytes uint64, d time.Duration) float64 {
 type fileSink struct {
 	w      *bufio.Writer
 	serial uint32
-	ogg    *oggOpusWriter
+	ogg    *oggopus.Writer
 	desc   mfcapture.AudioDesc
 
 	packets int
@@ -133,7 +134,7 @@ func (s *fileSink) start(d mfcapture.AudioDesc) {
 	if s.ogg != nil || s.err != nil {
 		return
 	}
-	ogg, err := newOggOpusWriter(s.w, d.Channels, d.PreSkip, s.serial)
+	ogg, err := oggopus.NewWriter(s.w, d.Channels, d.PreSkip, s.serial)
 	if err != nil {
 		s.err = err
 		return
@@ -150,7 +151,7 @@ func (s *fileSink) OnAudioFrame(f *audio.EncodedFrame) {
 		return
 	}
 	samples := int(f.Duration * audio.OpusSampleRate / time.Second)
-	if err := s.ogg.writePacket(f.Data, samples); err != nil {
+	if err := s.ogg.WritePacket(f.Data, samples); err != nil {
 		s.err = err
 		return
 	}

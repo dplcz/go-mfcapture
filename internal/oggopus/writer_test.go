@@ -1,4 +1,4 @@
-package main
+package oggopus
 
 import (
 	"bytes"
@@ -48,7 +48,7 @@ func parseOggPages(t *testing.T, b []byte) []parsedPage {
 		want := binary.LittleEndian.Uint32(hdr[22:26])
 		zeroed := append([]byte(nil), page...)
 		binary.LittleEndian.PutUint32(zeroed[22:26], 0)
-		if got := oggCRC(zeroed); got != want {
+		if got := crc(zeroed); got != want {
 			t.Fatalf("page at offset %d: CRC 0x%08X, want 0x%08X", off, got, want)
 		}
 
@@ -77,9 +77,9 @@ func parseOggPages(t *testing.T, b []byte) []parsedPage {
 func TestOggOpusWriterLayout(t *testing.T) {
 	var buf bytes.Buffer
 	const preSkip = 312
-	w, err := newOggOpusWriter(&buf, 2, preSkip, 0x1234)
+	w, err := NewWriter(&buf, 2, preSkip, 0x1234)
 	if err != nil {
-		t.Fatalf("newOggOpusWriter: %v", err)
+		t.Fatalf("NewWriter: %v", err)
 	}
 
 	// 255 字节与 300 字节覆盖 lacing 的边界；3 字节覆盖短包。
@@ -89,8 +89,8 @@ func TestOggOpusWriterLayout(t *testing.T) {
 		bytes.Repeat([]byte{0xBB}, 300),
 	}
 	for _, p := range packets {
-		if err := w.writePacket(p, 960); err != nil {
-			t.Fatalf("writePacket: %v", err)
+		if err := w.WritePacket(p, 960); err != nil {
+			t.Fatalf("WritePacket: %v", err)
 		}
 	}
 	if err := w.Close(); err != nil {
@@ -110,7 +110,7 @@ func TestOggOpusWriterLayout(t *testing.T) {
 			t.Errorf("page %d sequence = %d", i, p.seq)
 		}
 	}
-	if pages[0].flags&oggFlagBOS == 0 {
+	if pages[0].flags&FlagBOS == 0 {
 		t.Error("first page is not marked BOS")
 	}
 	if pages[0].granule != 0 || pages[1].granule != 0 {
@@ -141,17 +141,17 @@ func TestOggOpusWriterLayout(t *testing.T) {
 		if granule, wantGranule := p.granule, int64(960*(i+1)); granule != wantGranule {
 			t.Errorf("audio page %d granule = %d, want %d", i, granule, wantGranule)
 		}
-		if wantEOS := i == len(packets)-1; (p.flags&oggFlagEOS != 0) != wantEOS {
-			t.Errorf("audio page %d EOS = %v, want %v", i, p.flags&oggFlagEOS != 0, wantEOS)
+		if wantEOS := i == len(packets)-1; (p.flags&FlagEOS != 0) != wantEOS {
+			t.Errorf("audio page %d EOS = %v, want %v", i, p.flags&FlagEOS != 0, wantEOS)
 		}
 	}
 }
 
 func TestOggOpusWriterEmptyStream(t *testing.T) {
 	var buf bytes.Buffer
-	w, err := newOggOpusWriter(&buf, 1, 312, 7)
+	w, err := NewWriter(&buf, 1, 312, 7)
 	if err != nil {
-		t.Fatalf("newOggOpusWriter: %v", err)
+		t.Fatalf("NewWriter: %v", err)
 	}
 	if err := w.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
@@ -162,7 +162,7 @@ func TestOggOpusWriterEmptyStream(t *testing.T) {
 		t.Fatalf("got %d pages, want head + tags + empty EOS", len(pages))
 	}
 	last := pages[2]
-	if last.flags&oggFlagEOS == 0 {
+	if last.flags&FlagEOS == 0 {
 		t.Error("final page is not marked EOS")
 	}
 	if last.granule != -1 {
@@ -173,7 +173,7 @@ func TestOggOpusWriterEmptyStream(t *testing.T) {
 	}
 }
 
-func TestOggLacing(t *testing.T) {
+func TestLacing(t *testing.T) {
 	cases := []struct {
 		n    int
 		want []byte
@@ -186,8 +186,8 @@ func TestOggLacing(t *testing.T) {
 		{510, []byte{255, 255, 0}},
 	}
 	for _, c := range cases {
-		if got := oggLacing(c.n); !bytes.Equal(got, c.want) {
-			t.Errorf("oggLacing(%d) = %v, want %v", c.n, got, c.want)
+		if got := lacing(c.n); !bytes.Equal(got, c.want) {
+			t.Errorf("lacing(%d) = %v, want %v", c.n, got, c.want)
 		}
 	}
 }
