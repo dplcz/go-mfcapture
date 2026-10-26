@@ -59,13 +59,20 @@ const (
 	EventEncoderDegraded
 	// EventCaptureError 采集或编码发生非致命错误时触发。Err 为具体错误。
 	EventCaptureError
+	// EventCapturePaused 采集暂时不可用（例如锁屏/UAC 安全桌面）时触发一次。
+	// 下层会保持管线存活并按 captureRetryDelay 自动重试；Err 为触发原因。
+	// 该事件可能早于 EventDescReady 到达（启动时桌面就已锁屏），此时 Desc 为零值。
+	EventCapturePaused
+	// EventCaptureResumed 采集从暂停状态恢复时触发一次。恢复后的第一个编码帧
+	// 一定是关键帧（下层已调用 ForceKeyFrame），上层可据此重新下发描述/等待 IDR。
+	EventCaptureResumed
 )
 
 // Event 是下层向上层主动上报的状态变化。
 type Event struct {
 	Kind EventKind
 	Desc VideoDesc // DescReady / ResolutionChanged 时有效
-	Err  error     // CaptureError 时有效
+	Err  error     // CaptureError / CapturePaused 时有效
 }
 
 // Sink 是下层向上层交付数据的唯一通道。由上层实现。
@@ -152,6 +159,9 @@ type Pipeline struct {
 	deviceCtx *d3d11.ID3D11DeviceContext
 	devMgr    *mf.IMFDXGIDeviceManager
 	resetTok  uint32
+	// paused 表示采集处于"暂时不可用、正在重试"状态。只用于事件边沿去重，
+	// 由 setCapturePaused/setCaptureResumed 维护。
+	paused bool
 }
 
 type pipelineCmdKind uint8
@@ -257,6 +267,24 @@ func waitCaptureRetry(ctx context.Context) error {
 	}
 }
 
+// setCapturePaused 进入暂停状态并上报一次边沿事件。重复调用不会重复上报。
+func (p *Pipeline) setCapturePaused(cause error) {
+	if p.paused {
+		return
+	}
+	p.paused = true
+	p.sink.OnEvent(Event{Kind: EventCapturePaused, Err: cause})
+}
+
+// setCaptureResumed 退出暂停状态并上报一次边沿事件。未处于暂停时不做事。
+func (p *Pipeline) setCaptureResumed() {
+	if !p.paused {
+		return
+	}
+	p.paused = false
+	p.sink.OnEvent(Event{Kind: EventCaptureResumed})
+}
+
 // Run 在调用方 goroutine 上运行整条管线，直到 ctx 被取消。它是阻塞的。
 //
 // 返回的 error 为 ctx.Err()（正常结束）或具体的采集/编码错误。
@@ -310,6 +338,9 @@ func (p *Pipeline) Run(ctx context.Context) error {
 		if !errors.Is(err, capture.ErrCaptureUnavailable) {
 			return fmt.Errorf("NewDuplicator: %w", err)
 		}
+		// 启动时桌面就已锁屏：管线保持存活并重试，同时让上层能把"暂不可用"
+		// 传给对端（此时还没有任何描述，事件早于 EventDescReady）。
+		p.setCapturePaused(err)
 		if err := waitCaptureRetry(ctx); err != nil {
 			return err
 		}
@@ -340,6 +371,9 @@ func (p *Pipeline) Run(ctx context.Context) error {
 	if !p.encoder.IsHardware {
 		p.sink.OnEvent(Event{Kind: EventEncoderDegraded})
 	}
+	// 启动时曾因锁屏而暂停的，描述就绪后再上报恢复：对端此时已经知道流参数，
+	// 且新编码器的首帧必定是 IDR。
+	p.setCaptureResumed()
 
 	p.cursorMon = capture.NewCursorMonitor(p.sink.OnCursor, p.cfg.CursorFPS)
 	cursorCtx, stopCursor := context.WithCancel(ctx)
@@ -370,6 +404,8 @@ func (p *Pipeline) Run(ctx context.Context) error {
 				continue
 			}
 			if errors.Is(err, capture.ErrCaptureUnavailable) {
+				// 锁屏/UAC 期间桌面复制不可用：保持管线和编码器存活，边沿上报一次。
+				p.setCapturePaused(err)
 				if err := waitCaptureRetry(ctx); err != nil {
 					return err
 				}
@@ -381,11 +417,19 @@ func (p *Pipeline) Run(ctx context.Context) error {
 				if err := p.handleResolutionChange(); err != nil {
 					return err
 				}
+				p.setCaptureResumed()
 				_ = p.encoder.ForceKeyFrame()
 				continue
 			}
 			p.sink.OnEvent(Event{Kind: EventCaptureError, Err: err})
 			return fmt.Errorf("AcquireFrame: %w", err)
+		}
+
+		// 暂停后第一次成功取到帧：先上报恢复并强制下一个编码帧为 IDR，
+		// 对端据 CaptureState + 关键帧决定何时恢复输入/音频。
+		if p.paused {
+			p.setCaptureResumed()
+			_ = p.encoder.ForceKeyFrame()
 		}
 
 		hns := time.Since(start).Nanoseconds() / 100
